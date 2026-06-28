@@ -1,0 +1,44 @@
+#!/bin/bash
+# ============================================================
+# stenobot 設定ファイル（サンプル）
+# このファイルを config.sh にコピーして、自分の環境に合わせて編集してください。
+#   cp config.sh.example config.sh
+#   chmod 600 config.sh        # メールアドレス等を含むため権限を絞る
+# 各スクリプトはこの config.sh を読み込みます。
+# ============================================================
+
+# ----- パス設定 -----
+# 録音データ・文字起こしを保管するNASのマウント先（手動マウント前提）
+NAS="$HOME/radio_nas"
+# スクリプト・モデル・一時ファイルを置く内蔵ディレクトリ
+BASE="$HOME/radio"
+
+# ----- NAS接続情報（手動マウント時に使用）-----
+# 例: //USER@NAS_IP/SHARE
+NAS_SHARE="//USER@NAS_IP/SHARE"
+
+# ----- 音声入力デバイス -----
+# `ffmpeg -f avfoundation -list_devices true -i ""` で確認した音声デバイス番号
+AUDIO_DEVICE=":1"
+
+# ----- 録音設定 -----
+SEG_SECONDS=3600                 # 1ファイルの長さ（秒）。3600=1時間
+CHUNK_SECONDS=600                # whisper分割処理の1チャンク長（秒）
+
+# ----- whisper モデル -----
+MODEL_WHISPER="$BASE/models/ggml-large-v3-turbo.bin"
+
+# ----- メール通知（msmtp）-----
+MAIL_TO="you@example.com"
+MAIL_FROM="you@example.com"
+
+# ----- Claude API（校正に使用）-----
+CLAUDE_MODEL_FIX="claude-haiku-4-5-20251001"     # 校正モデル（Haiku）
+CLAUDE_KEY_FILE="$BASE/.anthropic_api_key"       # APIキー専用ファイル（chmod 600）
+CLAUDE_MAX_TOKENS_FIX=8000                        # 校正の出力上限
+FIX_CHUNK_LINES=20                                # 校正の1ブロック行数
+
+# ----- Gemini API（要約に使用・Google検索グラウンディング有効）-----
+GEMINI_MODEL="gemini-3.5-flash"                  # 要約モデル
+GEMINI_KEY_FILE="$BASE/.gemini_api_key"          # APIキー専用ファイル（chmod 600）
+GEMINI_MAX_TOKENS_SUM=4000                        # 要約の出力上限
