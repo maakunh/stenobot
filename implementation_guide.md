@@ -93,6 +93,9 @@ chmod 600 scripts/config.sh
 
 ### 4-1. オーディオ入力デバイス番号
 
+ラジオからMacへの音声入力経路に使う機材・接続方法・ノイズ対策は [hardware.md](hardware.md) に
+まとめています。配線が済んでいる前提で、ここでは録音に使う音声デバイス番号を確認します。
+
 ```bash
 ffmpeg -f avfoundation -list_devices true -i ""
 ```

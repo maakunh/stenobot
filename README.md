@@ -35,7 +35,7 @@ recordings/（mp3・永続保存）
 ## 必要環境
 
 - macOS（Mac mini を想定。`mount_smbfs` / `avfoundation` / `pmset` 等の macOS 機能を使用）
-- AMラジオの音声入力経路（USBオーディオIF等）
+- AMラジオの音声入力経路（USBオーディオIF等）。具体的な機材・接続・ノイズ対策は [hardware.md](hardware.md) を参照。
 - SMB 共有可能な NAS（手動マウント前提）
 - [Homebrew](https://brew.sh/)
 - Anthropic API キー（校正用）
