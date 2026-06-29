@@ -98,7 +98,18 @@ gemini_call() {
     text=$(printf '%s' "$resp" \
       | jq -r '.candidates[0].content.parts[]?.text // empty' 2>/dev/null \
       | sed '/^$/d')
+    # 生成終了理由を確認（STOP=正常 / MAX_TOKENS=上限切れ=途切れ）
+    finish=$(printf '%s' "$resp" | jq -r '.candidates[0].finishReason // empty' 2>/dev/null)
+
     if [[ -n "$text" ]]; then
+      if [[ "$finish" == "MAX_TOKENS" ]]; then
+        # 上限で途切れた。リトライ余地があれば次の試行へ、無ければ途切れたまま返す
+        echo "$(date '+%F %T') Gemini出力が上限(MAX_TOKENS)で途切れました。GEMINI_MAX_TOKENS_SUMの引き上げを検討してください。" >&2
+        if (( attempt < 3 )); then
+          sleep $(( attempt * 5 ))
+          continue
+        fi
+      fi
       printf '%s' "$text"
       return 0
     fi

@@ -41,4 +41,4 @@ FIX_CHUNK_LINES=20                                # 校正の1ブロック行数
 # ----- Gemini API（要約に使用・Google検索グラウンディング有効）-----
 GEMINI_MODEL="gemini-3.5-flash"                  # 要約モデル
 GEMINI_KEY_FILE="$BASE/.gemini_api_key"          # APIキー専用ファイル（chmod 600）
-GEMINI_MAX_TOKENS_SUM=4000                        # 要約の出力上限
+GEMINI_MAX_TOKENS_SUM=8000                        # 要約の出力上限
