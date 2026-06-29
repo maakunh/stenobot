@@ -268,6 +268,7 @@ VBAコードは規模が大きく機能追加で更新されるため、本手�
 | 機能 | 主なマクロ／処理 | 出力 |
 |---|---|---|
 | ログ取得・自動更新 | `StartLogging` / `StopLogging` / `LogSnapshot` | — |
+| 限月セルの毎分再計算 | `LogSnapshot` 内で Live!B1・C1 を再計算（TODAY()の更新） | Live!B1 / C1 |
 | オプション1分足の書き出し | `ExportDataJs` | `data.js` |
 | オプション1時間足（最大30日） | `ExportDataJsHourly` | `data_hourly.js` |
 | 先物/NT倍率（手動） | `ExportFutures` | `data_futures.js` |
