@@ -1,344 +1,562 @@
-# 実装ガイド (implementation_guide.md)
+# 日経225ミニオプション IV監視ダッシュボード 実装手順書
 
-AMラジオ録音・文字起こし・校正・要約・メール通知システムの構築手順です。
-このガイドだけで一式を構築できます。概要は [README.md](README.md) を参照してください。
-
-## 目次
-
-1. システム構成と設計方針
-2. 事前準備（パッケージ導入）
-3. 配置と設定（config.sh）
-4. デバイス・NAS接続情報の確認
-5. NAS認証情報の保存（Keychain）と手動マウント
-6. メール送信設定（msmtp）
-7. APIキーの設定（Claude / Gemini）
-8. whisperモデルの取得
-9. 起動・停止・再起動後の復帰
-10. 動作確認手順
-11. データ保持とコスト
-12. 既知の制約とトラブルシュート
+楽天証券「MarketSpeed II RSS」でリアルタイム取得したオプション・先物データを Excel に時系列で蓄積し、ブラウザ上の 4 つのダッシュボード（IVスマイル・価格/IVマルチチャート・IVヒートマップ・先物/NT倍率）で可視化する仕組みを、ゼロから構築するための手順書です。
 
 ---
 
-## 1. システム構成と設計方針
+## 0. 完成イメージと全体構成
+
+### この仕組みでできること
+
+- 日経225ミニオプションの全権利行使価格について、コール／プットの「現在値」と「IV（インプライド・ボラティリティ）」を 1 分ごとに自動取得・記録する
+- 記録したデータをブラウザの 4 ダッシュボードで可視化する
+  - **IVスマイル**：ある時点の権利行使価格×IVの曲線。時間変化も再生可能（1時間足・最大30日）
+  - **価格/IVマルチチャート**：行使価格ごとの推移を小チャートで一覧。価格⇔IVをトグルで切替（1分足）
+  - **IVヒートマップ**：行使価格×時刻のIVを色で表現（1時間足・最大30日）
+  - **先物/NT倍率**：日経225ミニ先物・ラージ先物・TOPIX先物のローソク足とNT倍率の曲線（別系統・手動更新）
+- オプション系のデータ更新はExcelが自動で行い、ブラウザは自動リロードで最新を反映。先物系は手動マクロで取り直す
+- データ更新の停止（G1の更新停止）を各画面が検知してアラート表示。ATMは先物ミニ現在値から自動判定
+
+### データの流れ
 
 ```
-   ※NASは事前に手動マウント。録音・解析はログインセッション内で nohup 常駐。
+MarketSpeed II（起動・ログイン）
+        │  RSS関数でリアルタイム取得
+        ▼
+Excel「Live」シート（現在値・IV・先物コードのスナップショット）
+        │  VBAが1分ごとに値をコピー
+        ▼
+Excel「Log」シート（時系列で縦に蓄積）
+        │  VBAが数分ごとに2種類を書き出し
+        ├───────────────┐
+        ▼               ▼
+data.js（1分足）    data_hourly.js（1時間足・最大30日）
+        │               │
+        ▼               ▼
+価格/IVマルチ      IVスマイル／IVヒートマップ
 
-[recorder.sh]  ──毎時00分区切りのmp3──▶ recordings/（永続保存）
- (nohup常駐)                              │
-                          (mark_done.sh が .done マーカー付与)
-                                          │
-[analyzer_loop.sh]                        ▼
-  └5分毎─▶[run_analyzer.sh]─▶[analyzer.sh]
-   1) whisper文字起こし(チャンク分割) ─▶ format_transcript.sh ─▶ transcripts/（生・30日）
-   2) 第1段 Claude Haiku 校正(行ブロック分割・欠落防止)        ─▶ corrected/（永続）
-   3) 第2段 Gemini 要約(Google検索グラウンディング) ─▶ texts/（30日）─▶ メール通知（添付付き）
+［別系統：手動］
+Excel「Chart」シート（RssChartで先物4本値を取得）
+        │  ExportFutures を手動実行
+        ▼
+data_futures.js（先物OHLC＋NT倍率）
+        ▼
+先物/NT倍率ダッシュボード
 ```
 
-### 設計方針
+### 用意するファイル（すべて同じフォルダに置く）
 
-- **録音は途切れない**: ffmpeg の segment 機能で壁時計の毎時00分に区切る。
-- **録音と解析の完全分離**: 解析が重くてもキューに溜めて順次消化。失敗は `.processed` 未付与で次回自動リトライ。
-- **長時間音声対策**: 文字起こしは `CHUNK_SECONDS` ごとのチャンク分割、校正は `FIX_CHUNK_LINES` 行ごとのブロック分割で、全編を確実に処理。
-- **校正の欠落防止**: 各ブロックの校正後に行数を検証し、入力と一致しなければ生テキストで代用。
-- **モデル使い分け**: 校正は機械的整形なので **Haiku**（安価・確実）、要約は固有名詞・時事の確認が活きる **Gemini + 検索グラウンディング**。
-- **手動マウント前提**: NASはログインセッションに紐づくため、launchdではなくセッション内 nohup で常駐させる。
-
----
-
-## 2. 事前準備（パッケージ導入）
-
-```bash
-brew install ffmpeg sox msmtp jq curl whisper-cpp
-```
-
-> whisper.cpp のコマンド名はバージョンにより `whisper-cli` か `whisper-cpp`。
-> `which whisper-cli || which whisper-cpp` で確認し、異なる場合は `scripts/analyzer.sh` 内の
-> `whisper-cli` を実際の名前に置換してください。
-
----
-
-## 3. 配置と設定（config.sh）
-
-```bash
-# リポジトリを ~/radio に配置（例）
-git clone https://github.com/USER/stenobot.git ~/radio
-cd ~/radio
-mkdir -p ~/radio/models ~/radio/work
-
-# 設定ファイルを作成
-cp scripts/config.sh.example scripts/config.sh
-chmod 600 scripts/config.sh
-```
-
-`scripts/config.sh` を編集し、以下を自分の環境に合わせます。
-
-| 変数 | 説明 |
-|---|---|
-| `NAS` | NASのマウント先（既定 `$HOME/radio_nas`） |
-| `BASE` | スクリプト・モデル・一時ファイルの内蔵ディレクトリ |
-| `NAS_SHARE` | 手動マウント時の共有パス（例 `//USER@NAS_IP/SHARE`） |
-| `AUDIO_DEVICE` | 音声入力デバイス番号（手順4で確認） |
-| `MAIL_TO` / `MAIL_FROM` | 通知メールの宛先・差出人 |
-| `MODEL_WHISPER` | whisperモデルのパス |
-| `CLAUDE_*` / `GEMINI_*` | モデル名・キーファイル・トークン上限 |
-| `SEG_SECONDS` / `CHUNK_SECONDS` / `FIX_CHUNK_LINES` | 録音長・チャンク長・校正ブロック行数 |
-
-> 各スクリプトは同じ `scripts/` 内の `config.sh` を読み込みます。スクリプト本体の編集は不要です。
-
----
-
-## 4. デバイス・NAS接続情報の確認
-
-### 4-1. オーディオ入力デバイス番号
-
-ラジオからMacへの音声入力経路に使う機材・接続方法・ノイズ対策は [hardware.md](hardware.md) に
-まとめています。配線が済んでいる前提で、ここでは録音に使う音声デバイス番号を確認します。
-
-```bash
-ffmpeg -f avfoundation -list_devices true -i ""
-```
-
-`[AVFoundation indev]` の **audio devices** の番号を `config.sh` の `AUDIO_DEVICE` に設定します
-（例 `:1`）。`:1` は「映像なし・音声デバイス1」の意味。挿し直すと番号が変わることがあります。
-
-### 4-2. NAS接続情報
-
-NAS側で共有フォルダと、読み書き権限を持つユーザーを用意します。プロトコルは SMB を推奨します。
-
----
-
-## 5. NAS認証情報の保存（Keychain）と手動マウント
-
-### 5-1. SMBクライアント設定（NASがSMB2までの場合）
-
-```bash
-sudo tee /etc/nsmb.conf >/dev/null <<'EOF'
-[default]
-protocol_vers_map=6
-signing_required=no
-EOF
-```
-
-`protocol_vers_map`: `2`=SMB2のみ / `6`=SMB2+SMB3 / `7`=全部。
-
-### 5-2. Keychainに認証情報を保存（対話入力でパスワードを安全に登録）
-
-```bash
-# 既存があれば削除（無ければ無視）
-security delete-internet-password -s "NAS_IP" -a "USER" -r "smb " 2>/dev/null
-security delete-internet-password -l "radio-nas" 2>/dev/null
-
-# 登録（Password: で対話入力）
-security add-internet-password \
-  -s "NAS_IP" -a "USER" -r "smb " \
-  -l "radio-nas" -T /sbin/mount_smbfs -w
-```
-
-`-s` の値は `mount_smbfs //USER@<ここ>/SHARE` の `<ここ>` と完全一致させます（IP接続ならIP）。
-
-### 5-3. 手動マウント
-
-```bash
-mkdir -p ~/radio_nas
-mount_smbfs -N //USER@NAS_IP/SHARE ~/radio_nas
-ls ~/radio_nas
-touch ~/radio_nas/.write_test && rm ~/radio_nas/.write_test && echo "書き込みOK"
-```
-
-> このマウントは実行したログインセッションに属します。録音・解析も同じセッションで nohup 起動します。
-> 再起動・スリープ復帰でNASが外れたら再マウントしてください。
-
----
-
-## 6. メール送信設定（msmtp）
-
-`~/.msmtprc`（**権限 600 必須**）:
-
-```
-defaults
-auth           on
-tls            on
-tls_starttls   on
-logfile        ~/.msmtp.log
-
-account        gmail
-host           smtp.gmail.com
-port           587
-from           you@example.com
-user           you@example.com
-password       <アプリパスワード等>
-
-account default : gmail
-```
-
-```bash
-chmod 600 ~/.msmtprc
-echo -e "Subject: test\n\nhello" | msmtp you@example.com
-```
-
-> Gmailの場合は2段階認証を有効化し「アプリパスワード」を発行して使用します。
-> 表示される16桁は **スペースを詰めて** 貼り付けてください（スペースありは認証失敗の原因）。
-> 通常のログインパスワードでは送信できません。
-
----
-
-## 7. APIキーの設定（Claude / Gemini）
-
-### 7-1. 保存（専用ファイル・chmod 600）
-
-```bash
-# Claude（校正用）: https://console.anthropic.com で発行
-printf '%s' 'sk-ant-...' > ~/radio/.anthropic_api_key
-chmod 600 ~/radio/.anthropic_api_key
-
-# Gemini（要約用）: https://aistudio.google.com/apikey で発行
-printf '%s' 'AIza...' > ~/radio/.gemini_api_key
-chmod 600 ~/radio/.gemini_api_key
-```
-
-### 7-2. 疎通テスト
-
-```bash
-# Claude（OKが返れば成功）
-KEY=$(cat ~/radio/.anthropic_api_key)
-curl -sS https://api.anthropic.com/v1/messages \
-  -H "x-api-key: $KEY" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
-  -d '{"model":"claude-haiku-4-5-20251001","max_tokens":50,"messages":[{"role":"user","content":"OKとだけ返して"}]}' \
-  | jq -r '.content[0].text'
-
-# Gemini（OKが返れば成功）
-GKEY=$(cat ~/radio/.gemini_api_key)
-curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent" \
-  -H "x-goog-api-key: $GKEY" -H "Content-Type: application/json" \
-  -d '{"contents":[{"role":"user","parts":[{"text":"OKとだけ返して"}]}]}' \
-  | jq -r '.candidates[0].content.parts[]?.text'
-```
-
----
-
-## 8. whisperモデルの取得
-
-```bash
-mkdir -p ~/radio/models
-curl -L -o ~/radio/models/ggml-large-v3-turbo.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
-```
-
-`large-v3-turbo` は精度と速度のバランス型です。速度優先なら `medium`、精度優先なら `large-v3` に
-差し替え可能（`config.sh` の `MODEL_WHISPER` を変更）。
-
----
-
-## 9. 起動・停止・再起動後の復帰
-
-### 起動（毎回 / 再起動後）
-
-```bash
-mount_smbfs -N //USER@NAS_IP/SHARE ~/radio_nas   # NASを手動マウント
-~/radio/scripts/start_all.sh                      # 録音・解析ループを起動
-```
-
-### 停止
-
-```bash
-~/radio/scripts/stop_all.sh
-# 必要ならアンマウント: umount ~/radio_nas
-```
-
-### 状態確認
-
-```bash
-pgrep -fl "segment.*radio_"   # 録音ffmpeg
-pgrep -fl analyzer_loop       # 解析ループ
-tail -5 ~/radio/recorder.err ~/radio/analyzer.out ~/radio/analyzer.err
-```
-
-> ログアウト・再起動で全停止します。復帰は「NAS手動マウント → `start_all.sh`」。
-
-### macOS 補足設定
-
-```bash
-sudo pmset -c sleep 0          # スリープ無効（常時録音のため）
-sudo pmset -c disksleep 0
-sudo systemsetup -gettimezone  # タイムスタンプ用にタイムゾーン確認（Asia/Tokyo等）
-```
-
-マイク権限は `start_all.sh` 初回でダイアログが出たら許可します。出ない場合は一度
-`~/radio/scripts/recorder.sh` を直接実行してダイアログを通してください。
-
----
-
-## 10. 動作確認手順
-
-### 10-1. 基本動作
-
-1. NASを手動マウントし、`~/radio/scripts/ensure_nas.sh; echo $?` が `0` を返すことを確認。
-2. APIキー疎通（手順7-2）で Claude・Gemini 両方が `OK` を返すことを確認。
-3. `~/radio/scripts/start_all.sh` で起動。
-4. 録音確認: `pgrep -fl "segment.*radio_"`、`ls -lt ~/radio_nas/recordings/`。
-5. 解析確認（最初の1ファイル完成後、`bash ~/radio/scripts/run_analyzer.sh` を手動実行可）:
-   - `transcripts/` に生文字起こし（1分毎TS・60行）
-   - `corrected/` に校正済み（ヘッダに `# 校正: Claude ...`、行欠落なし）
-   - `texts/` に要約（番組名・概要・話題）
-   - メール受信（4パス・番組名・時間帯・話題、校正済み文字起こしを添付）
-
-### 10-2. whisper JSON構造の確認（重要・初回）
-
-```bash
-which whisper-cli || which whisper-cpp
-whisper-cli -m ~/radio/models/ggml-large-v3-turbo.bin -l ja -f /path/to/test.wav -oj -of /tmp/test
-jq '.transcription[0]' /tmp/test.json
-#   { "offsets": { "from": 0, "to": 5230 }, "text": "..." } を期待
-```
-
-キーが異なる場合は `scripts/format_transcript.sh` の `(.offsets.from // 0)` と
-`scripts/analyzer.sh` の `.transcription[].text` 抽出を実キーに合わせます。
-
----
-
-## 11. データ保持とコスト
-
-### 保持方針
-
-| 保存先 | 内容 | 保持 |
+| ファイル名 | 役割 | 作り方 |
 |---|---|---|
-| `recordings/` | mp3・マーカー | 永続保存 |
-| `transcripts/` | 生文字起こし | 30日で自動削除 |
-| `corrected/` | 校正済み文字起こし | 永続保存 |
-| `texts/` | 解析結果（要約） | 30日で自動削除 |
-
-保持日数は `scripts/run_analyzer.sh` の `find ... -mtime +30` で調整します。mp3は永続保存のため
-容量が増え続けます（128kbps mono で約55MB/時≒約40GB/月）。空き容量が `recorder.sh` の閾値
-（既定5GB）を下回ると警告メールが届きます。古いmp3は外部ディスク等へ手動退避してください。
-
-### コスト
-
-- 校正（Claude Haiku）: 1時間分の入出力に対して課金。
-- 要約（Gemini 3.5 Flash）: トークン課金に加え、検索グラウンディングは検索クエリ数に応じて課金。
-  1回のAPI呼び出しで複数クエリが走るとそれぞれ課金対象になります。
-
-番組数・発話量により変動するため、運用開始後しばらくは各サービスのコンソールで実使用量を確認してください。
+| `（任意）.xlsm` | RSS関数とVBAを含むExcelブック本体 | 手順2〜5で作成 |
+| `data.js` | オプション1分足データ（自動生成） | VBAが書き出す |
+| `data_hourly.js` | オプション1時間足・最大30日（自動生成） | VBAが書き出す |
+| `data_futures.js` | 先物OHLC＋NT倍率（手動生成） | `ExportFutures` が書き出す |
+| `dashboard.html` | IVスマイル | 手順6で作成 |
+| `price_dashboard.html` | 価格/IVマルチチャート | 手順6で作成 |
+| `heatmap_dashboard.html` | IVヒートマップ | 手順6で作成 |
+| `futures_dashboard.html` | 先物/NT倍率 | 手順6で作成 |
+| `guide.html` | 使い方ガイド（任意） | 別途配布 |
 
 ---
 
-## 12. 既知の制約とトラブルシュート
+## 1. 事前準備
 
-- **ログアウト・再起動で全停止**: nohup運用のため。復帰は「NAS手動マウント → `start_all.sh`」。
-- **launchd 文脈ではNASに書けない**: 手動SMBマウントがログインセッションに属するため。これが
-  nohup 運用にしている理由です。
-- **録音が20分等で切れる**: mp3自体が短ければ録音側（デバイス番号・NAS書込）を確認。文字起こしだけ
-  切れる場合はチャンク分割で解消済み。校正が切れる場合は行ブロック分割＋欠落防止ガードで解消済み。
-- **校正で行欠落**: 各ブロックで入力行数と出力行数を検証し、不一致なら生テキストで代用するため
-  最終出力の行数は保証されます。ヘッダに「一部ブロックは校正失敗」と出た場合はAPI側の一時障害です。
-- **whisperのコマンド名/JSONキー**: バージョン依存。手順10-2で確認。
-- **多重起動防止ロックが残った**: `rmdir ~/radio/.analyzer.lock.d`（`stop_all.sh` でも掃除）。
-- **再処理したい**: 対象の `recordings/radio_*.mp3.done.processed` を削除すれば次回ループで再実行。
-- **要約の検索が過剰課金になる**: クエリ数が多い場合は要約プロンプトで検索条件を絞るか、要約モデルを
-  検索なしに切り替えます。
+### 1-1. 必要なもの
+
+- **楽天証券の口座**と **MarketSpeed II** のインストール（RSS機能を含む）
+- **Microsoft Excel**（デスクトップ版。Microsoft 365 / 2019 以降を推奨）
+- **Webブラウザ**（Microsoft Edge または Google Chrome）
+- インターネット接続（ダッシュボードがChart.jsをCDNから読み込むため）
+
+### 1-2. MarketSpeed II RSS を有効にする
+
+1. MarketSpeed II を起動し、ログインする
+2. メニューから RSS 機能を有効化する（Excelアドインとして登録される）
+3. Excel を起動し、リボンに RSS 関連のタブ／関数が使える状態になっていることを確認する
+
+> **重要**：RSS関数はMarketSpeed IIが起動・ログインしている間のみ値を返します。ログオフ中や未起動時は値が取得できません。
 
 ---
 
-以上で、録音から AI による校正・要約・メール通知までの一式が動作します。
-日常運用は「NAS手動マウント → `start_all.sh`」、停止は「`stop_all.sh`」です。
+## 2. Excelブックの作成とシート構成
+
+### 2-1. ブックを作成して保存する
+
+1. Excel で新規ブックを作成する
+2. **必ず一度「名前を付けて保存」する**。ファイルの種類は **「Excel マクロ有効ブック（*.xlsm）」** を選ぶ
+3. 保存先フォルダを決める（このフォルダが後で全ファイルの置き場所になる）
+
+> ブックを保存しておかないと、VBA が出力先フォルダを特定できず data.js を書き出せません。
+
+### 2-2. シートを用意する
+
+ブック内に次のシートを作る（シート名は正確に合わせる）。
+
+- **Live**：RSS関数を並べてリアルタイムのスナップショットを表示するシート（オプション＋先物コード）
+- **Log**：1分ごとのスナップショットを時系列で蓄積するシート
+- **Chart**：先物のヒストリカルチャート（`RssChart`）を配置するシート（先物/NT倍率ダッシュボード用。手順8で作成）
+
+> Chart シートは先物ダッシュボードを使う場合のみ必要です。オプション系（IVスマイル・価格/IVマルチ・ヒートマップ）だけなら Live と Log の2枚で動きます。
+
+> **RunLog** シートは、主要マクロの実行ログを記録するために初回実行時に自動作成される（手動で作る必要はない）。
+
+---
+
+## 3. 「Live」シートの構築（RSS関数）
+
+### 3-1. レイアウト
+
+「Live」シートを次の列構成にする。**データは4行目から**始める（1〜3行目はタイトル・見出し用）。
+
+| 列 | 内容 |
+|---|---|
+| A | 権利行使価格 |
+| B | コール銘柄コード |
+| C | コール現在値 |
+| D | コールIV |
+| E | プット銘柄コード |
+| F | プット現在値 |
+| G | プットIV |
+
+さらに、**1行目には次の特殊セル**を置く（ATM動的判定・ストール検知・先物チャート用）。これらは4行目以降のオプション表とは別の、単独セルの値である。
+
+| セル | 内容 | 用途 |
+|---|---|---|
+| B1 | 通常限月（`202507` 形式） | オプション銘柄コード生成・ミニ先物コード |
+| C1 | メジャーSQ限月（3・6・9・12月） | ラージ・TOPIX先物コード生成 |
+| F1 | 先物ミニ現在値 | ATM動的判定（最近接の行使価格をATMに） |
+| G1 | MarketSpeed II 取得時刻 | ストール検知（更新停止の監視軸） |
+| H1 | 日経225ミニ先物の銘柄コード | RssChart 参照 |
+| I1 | 日経225先物（ラージ）の銘柄コード | RssChart 参照（C1を参照して生成） |
+| J1 | TOPIX先物の銘柄コード | RssChart 参照（C1を参照して生成） |
+
+> **先物コードのメジャーSQ制約**：日経225ラージ先物とTOPIX先物は、**メジャーSQ限月（3・6・9・12月）でないと銘柄コードを取得できません**。そのため通常限月（B1）とは別に、メジャーSQ限月を **C1** に持たせ、**I1・J1 は C1 を参照**して銘柄コードを生成します。ミニ先物（H1）は通常限月（B1）ベースで構いません。限月をまたぐ際は B1・C1 を更新します。
+
+見出しの例（1〜3行目）：
+
+```
+1行目:           コール                    プット
+2行目:
+3行目: 権利行使価格 銘柄コード 現在値 IV 銘柄コード 現在値 IV
+4行目: 75375      （関数）   …
+```
+
+### 3-2. 銘柄コードを関数で生成する
+
+オプションの銘柄コードは一覧から探す必要はなく、`RssFOPCode` 関数で「銘柄種類・限月・C/P区分・行使価格」から自動生成できる。
+
+```
+=RssFOPCode(銘柄種類, 限月, C/P区分, 行使価格)
+```
+
+- **銘柄種類**：日経225ミニオプションは **`"N225MOP"`** を指定する
+- **限月**：`"202507"` のように年月6桁。ウィークリーオプションは語尾に `#n`（例 `"202507#2"`）
+- **C/P区分**：**コール = `1`、プット = `2`**
+- **行使価格**：`A4` などのセル参照
+
+> 銘柄種類 `N225MOP` は日経225「ミニ」オプション専用の指定。従来のラージのオプションとは別商品なので混同しないこと。IV項目名など他の引数表記は、楽天証券公式の RSS 関数リファレンス（`https://marketspeed.jp/guide/manual/ms2rss_function.pdf`）で確認すること。バージョンにより異なる場合がある。
+
+### 3-3. 現在値・IVを取得する
+
+生成した銘柄コードを使い、`RssFOPMarket` で各値を取得する。
+
+```
+=RssFOPMarket(銘柄コード, "取得項目")
+```
+
+各行（例：4行目）の数式イメージ：
+
+| セル | 数式 |
+|---|---|
+| B4（C銘柄コード） | `=RssFOPCode("N225MOP","202507",1,A4)` |
+| C4（C現在値） | `=RssFOPMarket(B4,"現在値")` |
+| D4（C_IV） | `=RssFOPMarket(B4,"IV")` |
+| E4（P銘柄コード） | `=RssFOPCode("N225MOP","202507",2,A4)` |
+| F4（P現在値） | `=RssFOPMarket(E4,"現在値")` |
+| G4（P_IV） | `=RssFOPMarket(E4,"IV")` |
+
+> `RssFOPCode` の第1引数が銘柄種類（`N225MOP`）、第2引数が限月、第3引数がC/P区分（コール=1／プット=2）、第4引数が行使価格。限月 `"202507"` の部分は対象限月に合わせて変更する。
+
+### 3-4. 全行使価格に展開する
+
+1. A列に対象の権利行使価格を縦に並べる（ATM中心に上下へ。例：125円刻みで上下数十本）
+2. 4行目の数式を、対象行の最終行までフィルコピーする
+3. コール・プット両方の現在値とIVが表示されることを確認する
+
+> この時点で「Live」シートに、全権利行使価格のリアルタイムなスナップショットが表示される状態になる。
+
+### 3-5. 限月の自動更新と先物銘柄コードの式
+
+B1（期近の通常限月）と C1（期近のメジャーSQ限月）は手入力もできるが、SQ日（第2金曜）を境に毎月切り替わるため、数式で自動更新するのが安全。先物の銘柄コード（I1・J1）はその限月を参照して組み立てる。
+
+#### セル **B1**：期近の通常限月（yyyymm）
+
+**B1セル**に次の式を入力する。今日がその月のSQ日（第2金曜）以前なら当月、過ぎていれば翌月を `yyyymm` で返す。
+
+```
+=TEXT(IF(TODAY()<=DATE(YEAR(TODAY()),MONTH(TODAY()),13-WEEKDAY(DATE(YEAR(TODAY()),MONTH(TODAY()),1),16)),DATE(YEAR(TODAY()),MONTH(TODAY()),1),DATE(YEAR(TODAY()),MONTH(TODAY())+1,1)),"yyyymm")
+```
+
+`13-WEEKDAY(その月1日,16)` でその月の第2金曜日を求めている（`WEEKDAY(...,16)` は金曜=1とする週設定）。
+
+#### セル **C1**：期近のメジャーSQ限月（yyyymm）
+
+**C1セル**に次の式を入力する。B1の月を、それ以上で最も近い3の倍数月（3・6・9・12）へ切り上げる。
+
+```
+=TEXT(DATE(VALUE(LEFT(B1,4)),CEILING(VALUE(MID(B1,5,2)),3),1),"yyyymm")
+```
+
+`CEILING(月,3)` でメジャーSQ月に切り上げ。年跨ぎ（例：B1が12月超で翌年へ）も `DATE` が処理する。
+
+#### セル **I1・J1**：ラージ・TOPIX先物の銘柄コード
+
+ラージ・TOPIX先物はメジャーSQ限月（C1）でないとコードが引けないため、`RssFOPCode` の限月引数に **C1** を参照させて組み立てる。
+
+**I1セル**（日経225先物・ラージ）:
+
+```
+=RssFOPCode("N225F",C1,,)
+```
+
+**J1セル**（TOPIX先物）:
+
+```
+=RssFOPCode("TOPXF",C1,,)
+```
+
+- 第1引数 **銘柄種類**：日経225ラージ先物は `"N225F"`、TOPIX先物は `"TOPXF"`
+- 第2引数 **限月**：メジャーSQ限月の **C1** を参照（`yyyymm`）
+- 第3・第4引数（C/P区分・行使価格）：先物には不要のため空欄
+
+C1を参照しているので、限月が変わっても C1 の自動更新（3-5前半）に追従して銘柄コードが切り替わる。ミニ先物（H1）は通常限月の B1 を限月引数に使う。
+
+> **ポイント**：H1（ミニ先物コード）は B1 を、I1・J1（ラージ・TOPIX）は C1 を参照する。B1・C1 を数式で自動更新しておけば、SQ日翌営業日に限月が繰り上がっても先物コードが自動で追従する。なお B1・C1 の数式は `TODAY()` を含むため、ブックを開きっぱなしで日付をまたぐと更新されないことがあるが、`LogSnapshot`（1分ごと）が B1・C1 を毎分再計算するので、ロガー稼働中は自動で最新化される（手順5）。
+
+> **検算**：数式を入れた直後、B1・C1 が当日時点の正しい限月（これまで手入力していた値）と一致するか確認する。SQ日周辺で値が想定とずれる場合は、B1式の不等号（`<=` と `<`）でSQ当日の扱いを調整する。
+
+---
+
+## 4. 「Log」シートの構築
+
+### 4-1. レイアウト
+
+「Log」シートの 1 行目に、次のヘッダーを入れる。
+
+| 列 | A | B | C | D | E | F |
+|---|---|---|---|---|---|---|
+| 1行目 | 時刻 | 権利行使価格 | C現在値 | C_IV | P現在値 | P_IV |
+
+データは2行目以降に、VBAが自動で縦に追記していく（**縦持ち＝1行が1行使価格の1スナップショット**）。最初は空でよい。
+
+---
+
+## 5. VBAマクロの実装
+
+### 5-1. マクロの取り込み（インポート方式）
+
+VBAコードは規模が大きく機能追加で更新されるため、本手順書には全文を掲載せず、**別添の `OptionLogger.bas` をインポートする方式**を採る。
+
+1. Excel で `Alt + F11` を押して VBエディタを開く
+2. メニュー「ファイル」→「ファイルのインポート」を選ぶ
+3. 配布物の `OptionLogger.bas` を選択して取り込む
+4. モジュール先頭の定数を環境に合わせて設定する（次項 5-3）
+
+### 5-2. OptionLogger.bas に含まれる機能
+
+| 機能 | 主なマクロ／処理 | 出力 |
+|---|---|---|
+| ログ取得・自動更新 | `StartLogging` / `StopLogging` / `LogSnapshot` | — |
+| オプション1分足の書き出し | `ExportDataJs` | `data.js` |
+| オプション1時間足（最大30日） | `ExportDataJsHourly` | `data_hourly.js` |
+| 先物/NT倍率（手動） | `ExportFutures` | `data_futures.js` |
+| 先物/NT倍率（自動・60分） | `StartFutures` / `StopFutures` / `FuturesTick` | `data_futures.js` |
+| ストール検知用メタ | G1の最終更新実時刻を記録 | `OPTION_META.lastAlive` |
+| ATM動的判定用メタ | 先物ミニ現在値(F1)を記録 | `OPTION_META.underlying` |
+| ダッシュボードを開く | `OpenDashboards` | — |
+| 緊急停止 | `ForceStopLogging` | — |
+| 実行ログの記録 | `WriteRunLog`（各マクロから自動呼び出し） | `RunLog` シート |
+
+> **VBAの記述位置に関する注意**：モジュールレベルの `Const`・`Dim` は、必ず手続き（Sub/Function）より前、モジュールの先頭に置くこと。手続きの後ろに書くと環境によって無視され、空文字として扱われて「シートが見つかりません」等の不可解なエラーになる。`OptionLogger.bas` は先物用の定数（`FUT_SHEET` など）も含め先頭にまとめてある。
+
+### 5-3. 設定値の意味
+
+| 定数 | 既定値 | 意味 |
+|---|---|---|
+| `INTERVAL` | `"00:01:00"` | ログ取得間隔。5分にするなら `"00:05:00"` |
+| `FIRST_DATA_ROW` | `4` | Liveシートのデータ開始行。レイアウトに合わせる |
+| `EXPORT_EVERY` | `5` | ログ何回ごとにdata.jsを書き出すか（1分間隔×5＝約5分ごと） |
+| `DASH_FOLDER` | `"C:\OptionDash"` | ダッシュボード一式とdata*.jsの出力先（OneDrive外推奨） |
+| `FUT_SHEET` | `"Chart"` | 先物RssChart式を配置したシート名（手順8） |
+| `FUT_FORMULA_ROW` | `2` | Chartシートで各RssChart式を置く行 |
+| `COL_MINI5`〜`COL_TP60` | `1,12,23,34,45` | 各先物系列の式起点列（11列間隔） |
+| `FUT_INTERVAL` | `01:00:00` | 先物自動更新の間隔（StartFutures） |
+| `RUNLOG_SHEET` | `RunLog` | 実行ログのシート名 |
+| `RUNLOG_MAX` | `10000` | 実行ログの最大行数（超えたら古い行から削除） |
+
+### 5-4. 動作確認
+
+1. MarketSpeed II が起動・ログイン済みで、Liveシートに値が出ていることを確認
+2. VBエディタで `StartLogging` を実行（または Excel の「開発」タブ→マクロ→`StartLogging`）
+3. 「Log」シートに、4行目以降ではなく**2行目以降**へ全行使価格分のデータが追記されることを確認
+4. 数分待ち、同じフォルダに `data.js` が生成されることを確認
+5. 止めるときは `StopLogging` を実行
+
+> **画面が固まる場合**：`Esc` または `Ctrl + Break` で中断。`FIRST_DATA_ROW` がLiveの実際のデータ開始行と一致しているか確認する（不一致だと余計な行まで読んで重くなる）。それでも止まらないときは `ForceStopLogging` を実行する。
+
+---
+
+## 6. ダッシュボードHTMLの設置
+
+4つのHTMLファイルを、`DASH_FOLDER`（既定 `C:\OptionDash`）に置く。各ファイルは対応するデータファイル（`data.js` / `data_hourly.js` / `data_futures.js`）を読み込み、ブラウザ上で描画する。文字コードは **UTF-8** で保存すること。
+
+> 各HTMLは配布物の実ファイルをそのまま `DASH_FOLDER` に置く。エディタで開く必要はない。
+
+### 6-1. ファイル名
+
+| ファイル名 | 内容 | 読み込むデータ |
+|---|---|---|
+| `dashboard.html` | IVスマイル（時刻スライダー・再生・OTM側IV・スキュー表示。1時間足・最大30日） | `data_hourly.js` |
+| `price_dashboard.html` | 価格/IVマルチチャート（価格⇔IVトグル・ATMバッジ。1分足） | `data.js` |
+| `heatmap_dashboard.html` | IVヒートマップ（コール/プット/OTM切替・色分け・ATM動的。1時間足・最大30日） | `data_hourly.js` |
+| `futures_dashboard.html` | 先物/NT倍率（ローソク足＋NT倍率曲線） | `data_futures.js` |
+
+### 6-2. 共通の仕様
+
+- 4画面は上部ナビで相互に行き来できる
+- 各画面右上の「自動更新」にチェックを入れると、5分ごとにページが自動リロードされ最新データを反映する
+- 「0」のデータ（板なし）は線を繋がず飛ばす設計
+- オプション3画面は、G1（取得時刻）の更新が一定時間途絶えると画面上部にアラートバナーを表示（ストール検知）
+- 先物画面は手動更新のため、`data_futures.js` 未生成のときのみ「ExportFutures を実行してください」と表示
+- ローソク足描画のため `futures_dashboard.html` のみ Chart.js financial プラグインと luxon をCDNから追加読み込み
+
+---
+
+## 7. 起動と運用
+
+### 7-1. 毎回の起動手順
+
+1. MarketSpeed II を起動・ログインする
+2. Excelブック（.xlsm）を開く（マクロを有効化する）
+3. Liveシートに値が表示されていることを確認する
+4. `StartLogging` を実行する
+5. 先物画面を使う場合は `StartFutures` を実行する（60分ごとに自動更新。手動なら `ExportFutures`）
+6. `OpenDashboards` を実行する（ブラウザでIVスマイルが開く）
+7. ダッシュボード右上の「自動更新」にチェックを入れる
+
+### 7-2. 終了手順
+
+1. `StopLogging`（または `ForceStopLogging`）を実行する
+2. 先物の自動更新を使っていた場合は `StopFutures` を実行する
+3. 必要に応じてブックを保存する（Logの蓄積を残す場合）
+
+### 7-3. 運用上の注意
+
+- **ログ取得中はExcelを開いたままにする**。`Application.OnTime` はExcelが起動していないと発火しない
+- 寄り付き前など板が薄い時間帯は現在値が「0」になることがあるが、ログ自体は正常に動く
+- ブラウザに最新が反映されないときは `Ctrl + F5`（強制再読み込み）
+- 監視する行使価格はATM中心に上下10〜15本程度に絞ると、描画も取得も安定する
+
+---
+
+
+---
+
+## 8. 先物/NT倍率ダッシュボードの構築（任意）
+
+先物画面はオプション系とは独立した別系統。`RssChart` でヒストリカルチャートを取得し、`ExportFutures`（手動マクロ）で `data_futures.js` を書き出す。
+
+### 8-1. Chartシートを作る
+
+#### 手順
+
+1. ブックにシートを1枚追加し、シート名を **`Chart`** にする（VBAの `FUT_SHEET` 定数の既定値と一致させる）
+2. 下表の各セルに `RssChart` 式を入力する。各式は1セルに入れると、そのセルの下方向に複数行・右方向に複数列へ自動展開（スピル）される
+3. MarketSpeed II にログイン済みの状態で、各列にOHLCデータが展開されることを確認する
+
+| 起点セル | 式 | 系列 | 足種/期間 | 列定数 |
+|---|---|---|---|---|
+| A2 | `=RssChart(,Live!H1,"5M",300)` | ミニ先物 | 5分足 / 24時間 | `COL_MINI5=1` |
+| L2 | `=RssChart(,Live!I1,"D",260)` | ラージ | 日足 / 1年 | `COL_LGD=12` |
+| W2 | `=RssChart(,Live!I1,"60M",500)` | ラージ | 60分足 / 30日 | `COL_LG60=23` |
+| AH2 | `=RssChart(,Live!J1,"D",260)` | TOPIX | 日足 / 1年 | `COL_TPD=34` |
+| AS2 | `=RssChart(,Live!J1,"60M",500)` | TOPIX | 60分足 / 30日 | `COL_TP60=45` |
+
+#### 列レイアウト（11列間隔）
+
+各 `RssChart` は10列（銘柄名称・市場名称・足種・日付・時刻・始値・高値・安値・終値・出来高）に展開される。隣の系列とスピルが衝突しないよう、**10列＋余白1列＝11列間隔**で起点を配置している。
+
+```
+列:  A          L          W          AH         AS
+     ミニ5分    ラージ日足  ラージ60分  TOPIX日足  TOPIX60分
+     |←10列→|余白|←10列→|余白|←10列→|余白|←10列→|余白|←10列→|
+```
+
+各系列内の列の並び（起点列を基準とした相対位置）は次の通り。VBAの `SeriesJs` はこの並びを前提に、日付・時刻・始値・高値・安値・終値を読み取る。
+
+| 相対列 | +0 | +1 | +2 | +3 | +4 | +5 | +6 | +7 | +8 | +9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 項目 | 銘柄名称 | 市場名称 | 足種 | 日付 | 時刻 | 始値 | 高値 | 安値 | 終値 | 出来高 |
+
+#### RssChartの引数
+
+```
+=RssChart( ヘッダー行(省略可), 銘柄コード, 足種, 表示本数 )
+```
+
+- **ヘッダー行**：省略（先頭のカンマのみ）。省略時は上表の10項目が値だけ展開される
+- **銘柄コード**：Liveシートの先物コードを参照（ミニ=H1、ラージ=I1、TOPIX=J1）
+- **足種**：`"5M"`（5分）／`"60M"`（60分）／`"D"`（日足）
+- **表示本数**：直近からの本数。24時間ぶんの5分足で約300本、1年の日足で約260本、30日の60分足で約500本を目安にしている
+
+#### 確認
+
+- データは式を入れた行（2行目）の**1行下（3行目）から**下方向に展開されるのが既定。VBAは式セル行の次行以降を走査し、終値が数値の行だけ採用する
+- 展開開始行が環境で異なる場合は、`OptionLogger.bas` の `FUT_FORMULA_ROW`（既定2）を実際の式セル行に合わせる
+- 列やシート名を変えたい場合は `COL_*` / `FUT_SHEET` 定数で調整する
+
+> **メジャーSQ限月の制約**：ラージ・TOPIX先物（I1・J1）はメジャーSQ限月でないと銘柄コードを取得できないため、メジャーSQ限月を Live!C1 に持たせ I1・J1 がこれを参照する（手順3-5参照）。期近のミニ先物（H1）は通常限月 B1 ベース。
+
+### 8-2. data_futures.js を書き出す
+
+1. Chartシートに各 `RssChart` のデータが展開されていることを確認する
+2. `ExportFutures` を実行する
+3. `DASH_FOLDER` に `data_futures.js` が生成される
+4. `futures_dashboard.html` をブラウザで開くと、6チャート（ミニ5分足・ラージ日足/60分足・TOPIX日足/60分足のローソク足＋NT倍率の曲線）が表示される
+
+NT倍率はラージ日足終値÷TOPIX日足終値を日付で対応させてVBA側で自動算出する（新規取得は不要）。
+
+> `ExportFutures` は手動・毎回取り直しの別系統。`StartFutures` を実行すると60分ごとに自動更新される（停止は `StopFutures`）。オプションの `StartLogging`（1分ループ）とは独立した別タイマーで動く。データ展開開始行が想定（式セルの1行下）と異なる場合は `FUT_FORMULA_ROW` を、シート名や列を変える場合は `FUT_SHEET` / `COL_*` を調整する。
+
+---
+
+## 9. リモート閲覧（Tailscale）
+
+ダッシュボードを外出先の自分の端末からも見たい場合、Google ドライブ等の公開ホスティングは使えない（HTMLホスティング機能は廃止済みで、`<script src>` の相対参照も成立しない）。代わりに、配信元PCに軽量Webサーバーを立て、Tailscaleで自分の端末だけに見せる方式が手軽で安全。
+
+### 9-1. 配信元PCにWebサーバーを立てる
+
+`DASH_FOLDER` で1コマンド（Python導入済みの場合）。
+
+```
+cd C:\OptionDash
+python -m http.server 8000
+```
+
+Windowsファイアウォールでポート8000の受信許可を追加する（管理者コマンドプロンプト）。
+
+```
+netsh advfirewall firewall add rule name="OptionDash 8000" dir=in action=allow protocol=TCP localport=8000
+```
+
+### 9-2. Tailscaleで自分の端末をつなぐ
+
+1. 配信元PCと、見る側の端末（スマホ・ノートPC）すべてに Tailscale をインストールし、**同じアカウント**でログインする
+2. 見る側のブラウザで `http://<配信元のTailscale名 or 100.x.x.x>:8000/dashboard.html` を開く
+
+公開URLは存在せず、自分のテールネット内の端末からしか到達できないため、他人と共有されない。MarketSpeed II を手動起動する運用なら、Webサーバーも同じタイミングで手動起動すればよく、常時起動（タスクスケジューラ登録）は不要。
+
+> 名前で繋がらないときは IP 直打ち（`100.x.x.x:8000`）を試す。IPで繋がれば経路は正常で、MagicDNS（Tailscale管理コンソールで有効化）の問題。接続がタイムアウトする場合はファイアウォールのポート許可を確認する。
+
+## 10. トラブルシューティング
+
+| 症状 | 主な原因 | 対処 |
+|---|---|---|
+| RSS関数が `#NAME?` や値なし | MarketSpeed II 未起動／RSS未有効 | MarketSpeed IIを起動・ログインし、RSSを有効化 |
+| Liveのヘッダーがログに混入 | `FIRST_DATA_ROW` がデータ開始行と不一致 | 実際の開始行に合わせて修正（本例は4） |
+| 実行した瞬間に固まる | A列の空セルを大量ループ | `WorksheetFunction.Count` 版（本手順のコード）を使用 |
+| data.jsが出ない | ブック未保存でフォルダ未確定 | ブックを.xlsmで保存してから再実行 |
+| ダッシュボードが「data.js が読み込めません」 | HTMLに `<script src="data.js">` が無い／別フォルダ | HTMLの`<head>`にscriptタグを追加、同一フォルダに配置 |
+| グラフが更新されない | ブラウザキャッシュ | `Ctrl + F5` で強制再読み込み |
+| 文字化け | data.jsの文字コード | 本手順の `ADODB.Stream`（UTF-8指定）版で書き出す |
+| `ByRef 引数の型が一致しません` | Variantのセル値を `= ""` で比較／Const をByRefで渡す | 空判定を `Len(Trim(CStr(v)))=0` 方式に、補助関数の引数を `ByVal` にする（最新の `OptionLogger.bas` は対応済み） |
+| `「」シートが見つかりません`（先物） | `Chart` シート未作成、または `FUT_SHEET` 定数が手続きの後ろにあり空扱い | `Chart` シートを作る／定数をモジュール先頭に置く（最新版は対応済み） |
+| 先物チャートが空・本数が変 | RssChartのデータ展開開始行のずれ | `FUT_FORMULA_ROW` を実際の展開開始行に合わせる |
+| 先物コードが取得できない | ラージ/TOPIXに通常限月を指定 | メジャーSQ限月を Live!C1 に置き I1・J1 がこれを参照する |
+| リモートで繋がらない（タイムアウト） | Windowsファイアウォールがポート8000を遮断 | `netsh advfirewall` で受信許可を追加（手順9-1） |
+
+---
+
+## 11. データ構造リファレンス
+
+### 11-1. Logシート（縦持ち）
+
+| 列 | 内容 | 例 |
+|---|---|---|
+| A | 時刻（文字列） | `2026/06/24 10:00:00` |
+| B | 権利行使価格 | `70000` |
+| C | コール現在値 | `1845` |
+| D | コールIV | `38.27` |
+| E | プット現在値 | `2350` |
+| F | プットIV | `36.63` |
+
+### 11-2. RunLogシート（実行ログ）
+
+| 列 | 内容 | 例 |
+|---|---|---|
+| A | 日時（文字列） | `2026/06/25 09:00:10` |
+| B | 機能（マクロ名） | `StartLogging` |
+| C | 備考 | `ログ取得開始` |
+
+主要マクロの実行時に1行追記される。データ行数が `RUNLOG_MAX`（既定1万行）を超えると、ヘッダー直下（最古）から超過分が自動削除される。`先物更新` は備考で「手動」と「自動60分」を区別。
+
+### 11-3. data.js / data_hourly.js / data_futures.js
+
+```javascript
+window.OPTION_DATA = [
+["2026/06/24 10:00:00",75375,340,32.28,0,32.2],
+["2026/06/24 10:00:00",75250,350,34.2,0,34.13],
+...
+];
+```
+
+各要素は `[時刻, 権利行使価格, C現在値, C_IV, P現在値, P_IV]` の配列。HTMLはこれを `window.OPTION_DATA` として読み込み、時刻や行使価格でグループ化して描画する。
+
+`data_hourly.js` は同じ配列形式を `window.OPTION_DATA_H` として持つ（時刻は正時表記 `2026-06-25 10:00`、1時間足・最大30日に間引き済み）。両ファイルとも末尾にメタ情報が付く。
+
+```javascript
+window.OPTION_META = {lastAlive:"2026-06-25 10:00:10", underlying:38520};
+```
+
+`lastAlive` はG1の最終更新実時刻（ストール検知用）、`underlying` は先物ミニ現在値（ATM動的判定用）。
+
+`data_futures.js` は先物6系列とNT倍率を持つ。
+
+```javascript
+window.FUTURES_DATA = {
+  mini5: [{t:"2026-06-25 09:00",o:38500,h:38550,l:38480,c:38520}, ...],
+  lgD:  [{t:"2026-06-24",o:38400,h:38600,l:38350,c:38500}, ...],
+  lg60: [...], tpD: [...], tp60: [...],
+  nt:   [{t:"2026-06-24",v:13.7011}, ...]
+};
+window.FUTURES_META = {generated:"2026-06-25 09:33:10"};
+```
+
+OHLC各系列は `{t,o,h,l,c}`、NT倍率は `{t,v}`。日足は `t` が `yyyy-MM-dd`、分足は `yyyy-MM-dd HH:mm`。
+
+---
+
+## 付録A. dashboard.html（IVスマイル）
+
+> ※本文は別添の `dashboard.html` を参照。`<head>` 内で Chart.js（CDN）と `data.js` を読み込み、時刻スライダーでスマイルの時間変化を表示する。
+
+## 付録B. price_dashboard.html（価格/IVマルチチャート）
+
+> ※本文は別添の `price_dashboard.html` を参照。行使価格ごとの推移を小チャートで格子状に表示。価格⇔IVトグル、ATM動的判定＋ATMバッジに対応。
+
+## 付録C. heatmap_dashboard.html（IVヒートマップ）
+
+> ※本文は別添の `heatmap_dashboard.html` を参照。行使価格×時刻のIVを色分け表示。ATMは先物ミニ現在値から動的判定。
+
+## 付録D. futures_dashboard.html（先物/NT倍率）
+
+> ※本文は別添の `futures_dashboard.html` を参照。先物6系列のローソク足とNT倍率の曲線を表示。Chart.js financialプラグインとluxonをCDNから追加読み込みする。
+
+---
+
+## 改訂メモ
+
+- 本手順書は MarketSpeed II RSS の関数仕様に依存する。RSS関数の項目名・引数はバージョンにより変わることがあるため、公式リファレンスで最新を確認すること。
+- ダッシュボードはChart.jsをCDN（`cdn.jsdelivr.net`）から読み込むため、オフライン環境では別途ローカルにライブラリを配置する改修が必要。先物画面はfinancialプラグイン・luxonも追加で読み込む。
+- 本手順書は v1.2 時点（4ダッシュボード構成・1時間足・ATM動的判定・ストール検知・先物/NT倍率・Tailscaleリモート閲覧）に対応。VBAは別添 `OptionLogger.bas` のインポート方式とし、本文には全文を掲載しない。
