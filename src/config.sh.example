@@ -24,6 +24,10 @@ AUDIO_DEVICE=":1"
 # ----- 録音設定 -----
 SEG_SECONDS=3600                 # 1ファイルの長さ（秒）。3600=1時間
 CHUNK_SECONDS=600                # whisper分割処理の1チャンク長（秒）
+# 入力デバイスの実サンプルレート（Hz）。SB-PLAY3 等は 44100 か 48000 が多い。
+# `ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 test.wav` のログの "... Hz" で確認。
+# ここが実レートとズレると再生が短く・早口になる（v1.1で追加）。
+INPUT_RATE=48000
 
 # ----- whisper モデル -----
 MODEL_WHISPER="$BASE/models/ggml-large-v3-turbo.bin"
