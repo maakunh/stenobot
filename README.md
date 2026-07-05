@@ -1,6 +1,6 @@
 # stenobot
 
-> ラジオを聴いて書き起こす、AI速記者（steno + bot）。 **（v1.1）**
+> ラジオを聴いて書き起こす、AI速記者（steno + bot）。
 
 AMラジオを Mac mini で**連続録音**し、**文字起こし → AI校正 → AI要約 → メール通知**まで自動化するパイプラインです。
 
@@ -69,9 +69,18 @@ curl -L -o ~/radio/models/ggml-large-v3-turbo.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
 
 # 5. NAS を手動マウントして起動
-mount_smbfs -N //USER@NAS_IP/SHARE ~/radio_nas
+#    OS（Mac mini）起動後、まず NAS を手動マウントする（標準手順）。
+#    実行するとパスワードの入力を求められるので、入力する。
+mkdir -p ~/radio_nas
+mount_smbfs //USER@NAS_IP/SHARE ~/radio_nas   # Password: と表示されたら入力
 ~/radio/scripts/start_all.sh
 ```
+
+> **NAS の手動マウントについて**
+> stenobot は NAS を自動マウントしません。**OS 起動後（および再起動・スリープ復帰でマウントが
+> 外れた後）は、都度この `mount_smbfs` を手動実行してパスワードを入力する**のが標準手順です。
+> マウントが済んでいないと録音・解析は開始されません（`ensure_nas.sh` がマウント済み＋書き込み可を
+> 確認します）。マウント確認は `mount | grep radio_nas` で行えます。
 
 詳細な手順は [implementation_guide.md](implementation_guide.md) を参照してください。
 
@@ -142,55 +151,6 @@ rm ~/radio_nas/recordings/radio_20260628_2100.mp3.done.processed
 rm ~/radio_nas/recordings/radio_20260628_2200.mp3.done.processed
 bash ~/radio/scripts/run_analyzer.sh
 ```
-
-### 録音が短く・早口になる場合（サンプルレート不一致）
-
-録音ファイルの中身は0分0秒〜59分59秒あるのに、再生の長さが48分ほどに縮み、少し早口
-（ピッチが高い）に聞こえる場合は、**入力サンプルレートの不一致**が原因です。
-
-`avfoundation` はオーディオIF（SB-PLAY3 等）の**固有レート**（多くは 44100/48000 Hz）で
-音声を渡します。旧版（v1.0）は入力レートを宣言せず出力側 `-ar 16000` だけを指定していたため、
-デバイスが 48000 で渡しているのに 16000 と誤認され、リサンプルが正しく効かず等速コピー扱いに
-なって、60分が48分ほどに縮む・ピッチが上がる、という症状が出ることがありました。
-
-**v1.1 で修正済み**です。`config.sh` に入力実レートを設定してください。
-
-```bash
-# 1. デバイスの実サンプルレートを確認（ログの "... Hz" を見る）
-ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 /tmp/test.wav
-#   例: "Stream #0:0: Audio: pcm_..., 48000 Hz, mono" → 48000
-
-# 2. config.sh に実レートを設定（44100 なら 44100 に）
-#    INPUT_RATE=48000
-
-# 3. 録音を再起動
-~/radio/scripts/stop_all.sh
-~/radio/scripts/start_all.sh
-```
-
-recorder.sh は `-f avfoundation -ar "$INPUT_RATE" -i "$AUDIO_DEVICE"` のように、
-**入力レートを `-i` の前で宣言**するようになりました。これで入力→16kHzへのリサンプルが
-正しく行われ、60分の内容が等速・正しいピッチの60分で保存されます。
-
-#### 既に録れてしまった早口ファイルの救済
-
-録り直さずに、`atempo` で間延びさせて等速化できます（実レート48000・誤認16000＝比率 1/3 でなく、
-症状から実効比 0.8 の場合の例）。倍率は「正しい長さ ÷ 現在の長さ」で求めます。
-
-```bash
-# 例: 48分(2880秒)を60分(3600秒)へ → 倍率 2880/3600 = 0.8
-ffmpeg -i radio_in.mp3 -filter:a "atempo=0.8" -ar 16000 -ac 1 radio_fixed.mp3
-```
-
-> `atempo` は 0.5〜2.0 の範囲。範囲外は `atempo=0.8,atempo=0.9` のように連結します。
-> 正確な倍率は「録音の実尺（60分など） ÷ 実際の再生時間」で算出してください。
-
-## 変更履歴
-
-- **v1.1** — 録音のサンプルレート不一致を修正。`avfoundation` の入力レートを
-  `config.sh` の `INPUT_RATE` で宣言するようにし、再生が短く・早口になる問題を解消。
-  `hardware.md` にサンプルレート確認手順を追記。
-- **v1.0** — 初版。連続録音＋文字起こし＋AI校正＋AI要約＋メール通知の一連パイプライン。
 
 ## 注意事項
 

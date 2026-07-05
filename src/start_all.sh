@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/config.sh"
 # 1) NASマウント確認（未マウントなら案内して終了）
 if ! "$SCRIPT_DIR/ensure_nas.sh"; then
   echo "NASが未マウント、または書き込み不可です。先に手動マウントしてください："
-  echo "  mount_smbfs -N ${NAS_SHARE} ${NAS}"
+  echo "  mount_smbfs ${NAS_SHARE} ${NAS}"
   exit 1
 fi
 
