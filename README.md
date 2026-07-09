@@ -1,6 +1,6 @@
 # stenobot
 
-> ラジオを聴いて書き起こす、AI速記者（steno + bot）。
+> ラジオを聴いて書き起こす、AI速記者（steno + bot）。 **（v1.2）**
 
 AMラジオを Mac mini で**連続録音**し、**文字起こし → AI校正 → AI要約 → メール通知**まで自動化するパイプラインです。
 
@@ -151,6 +151,69 @@ rm ~/radio_nas/recordings/radio_20260628_2100.mp3.done.processed
 rm ~/radio_nas/recordings/radio_20260628_2200.mp3.done.processed
 bash ~/radio/scripts/run_analyzer.sh
 ```
+
+### 録音が短く・早口になる場合（サンプルレート不一致）
+
+録音ファイルの中身は0分0秒〜59分59秒あるのに、再生の長さが48分ほどに縮み、少し早口
+（ピッチが高い）に聞こえる場合は、**サンプルレートの不一致**が原因です。
+
+`avfoundation` はオーディオIF（SB-PLAY3 等）の**固有レート**（多くは 44100/48000 Hz）で
+音声を渡します。旧版（v1.0）は出力側 `-ar 16000` だけを指定していたため、環境によっては
+リサンプルが効かず等速コピー扱いになり、60分が48分ほどに縮む・ピッチが上がる症状が出ることが
+ありました。なお `avfoundation` は入力サンプルレートを指定するオプションを持たないため、
+`-ar` を `-i` の前に置くと `Option sample_rate not found` で失敗します。
+
+**v1.1 で修正済み**です。recorder.sh は出力直前に `aresample=16000` フィルタを明示し、
+デバイスが出す任意のレートを16kHzへ確実に変換します。`config.sh` の `INPUT_RATE` は
+確認・記録用のメモです。
+
+```bash
+# デバイスの実サンプルレートを確認（ログの "... Hz" を見る）
+ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 /tmp/test.wav
+#   例: "Stream #0:0: Audio: pcm_..., 48000 Hz, stereo" → 48000
+
+# 録音を再起動
+~/radio/scripts/stop_all.sh
+~/radio/scripts/start_all.sh
+```
+
+#### 既に録れてしまった早口ファイルの救済
+
+録り直さず、`atempo` で間延びさせて等速化できます。倍率は「実際の再生時間 ÷ 本来の長さ」。
+
+```bash
+# 例: 48分(2880秒)を60分(3600秒)へ → 倍率 2880/3600 = 0.8
+ffmpeg -i radio_in.mp3 -filter:a "atempo=0.8" -ar 16000 -ac 1 radio_fixed.mp3
+```
+
+> `atempo` は 0.5〜2.0 の範囲。範囲外は `atempo=0.8,atempo=0.9` のように連結します。
+
+### 録音が無音になる場合
+
+生成される mp3 が無音のときは、まず入力段を切り分けます。
+
+```bash
+# 5秒録って音量を確認（mean_volume が -90dB 前後ならほぼ無音）
+ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 /tmp/raw.wav
+ffmpeg -i /tmp/raw.wav -af volumedetect -f null - 2>&1 | grep -E "mean_volume|max_volume"
+```
+
+無音（-90dB 前後）の場合、原因はスクリプトではなく入力経路です。よくある順に、
+SB-PLAY3 の**入力端子（ピンク）に挿さっているか**（緑=出力ではないか）、macOS の
+サウンド入力ゲインが0でないか、ラジオの電源・音量・ヘッドホン出力、アイソレーターと
+3.5mmプラグの挿し込みを確認してください。デバイス番号は USB 抜き挿しで変わるため、
+`ffmpeg -f avfoundation -list_devices true -i ""` で番号を再確認し、`config.sh` の
+`AUDIO_DEVICE` を合わせます。
+
+## 変更履歴
+
+- **v1.2** — 通知メールの各話題に「分野」を追加（話の内容から分野を一言で表記、複数は
+  カンマ区切り）。Gemini 要約フォーマットに `話題N分野` を追加。
+- **v1.1** — 録音のサンプルレート不一致を修正（出力直前に `aresample=16000` を明示し、
+  再生が短く・早口になる問題を解消）。NAS 手動マウント手順を `-N` なし・OS起動後の
+  パスワード入力方式に統一。`hardware.md` にサンプルレート確認手順、README に無音時の
+  切り分け手順を追記。
+- **v1.0** — 初版。連続録音＋文字起こし＋AI校正＋AI要約＋メール通知の一連パイプライン。
 
 ## 注意事項
 

@@ -25,8 +25,9 @@ AUDIO_DEVICE=":1"
 SEG_SECONDS=3600                 # 1ファイルの長さ（秒）。3600=1時間
 CHUNK_SECONDS=600                # whisper分割処理の1チャンク長（秒）
 # 入力デバイスの実サンプルレート（Hz）。SB-PLAY3 等は 44100 か 48000 が多い。
+# 注意: avfoundation は入力レートを指定できないため、この値は確認・記録用のメモ。
+# 実際の変換は recorder.sh の aresample=16000 が行う（whisper.cpp が16kHz前提）。
 # `ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 test.wav` のログの "... Hz" で確認。
-# ここが実レートとズレると再生が短く・早口になる（v1.1で追加）。
 INPUT_RATE=48000
 
 # ----- whisper モデル -----

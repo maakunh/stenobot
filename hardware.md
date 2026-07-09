@@ -132,33 +132,23 @@ stenobot は AMラジオの音声を Mac mini に入力して録音します。�
 
 ---
 
-## サンプルレートの確認（重要・v1.1）
+## サンプルレートの確認（v1.1）
 
-USBオーディオIFは機種ごとに**固有のサンプルレート**を持ちます（SB-PLAY3 等は 44100 または
-48000 Hz が一般的）。`avfoundation` はこの固有レートで音声を Mac に渡すため、録音側でこのレートを
-正しく宣言しないと、リサンプルが効かず**再生が短く・早口（ピッチ上昇）になる**症状が出ます。
+USBオーディオIFは機種ごとに固有のサンプルレートを持ちます（SB-PLAY3 等は 44100 または
+48000 Hz が一般的）。`avfoundation` はこの固有レートで音声を渡すため、録音側で正しく
+16kHzへ変換しないと、再生が短く・早口（ピッチ上昇）になる症状が出ます。
 
-例えば実 48000 Hz を 16000 Hz と誤認したまま等速コピーされると、60分の内容が48分ほどに縮み、
-声が高く早口になります。
-
-### 実レートの確認方法
+`avfoundation` は入力サンプルレートを指定するオプションを持たない（`-ar` を `-i` の前に
+置くと `Option sample_rate not found` で失敗する）ため、stenobot は recorder.sh の出力側
+フィルタ `-af "aresample=16000"` でリサンプルします。`config.sh` の `INPUT_RATE` は
+確認・記録用のメモです。
 
 ```bash
 # デバイス番号を確認
 ffmpeg -f avfoundation -list_devices true -i ""
-
-# 数秒だけ録って、ログの "... Hz" を確認
+# 数秒録って実レートを確認（ログの "... Hz"）
 ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 /tmp/test.wav
-#   → "Stream #0:0: Audio: pcm_..., 48000 Hz, mono" のような行の数値が実レート
 ```
-
-確認した値を `config.sh` の `INPUT_RATE`（例: `INPUT_RATE=48000`）に設定します。
-recorder.sh は `-f avfoundation -ar "$INPUT_RATE" -i "$AUDIO_DEVICE"` の形で入力レートを
-宣言し、出力で 16kHz mono へ正しくリサンプルします（whisper.cpp が16kHz前提のため）。
-
-> USB機器の抜き挿しでデバイス番号が変わることがあるのと同様、機種を替えたら実レートも
-> 確認し直してください。`INPUT_RATE` を config 側に持たせているので、本体スクリプトの
-> 編集は不要です。
 
 ---
 

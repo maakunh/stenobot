@@ -7,9 +7,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 REC_DIR="$NAS/recordings"
 
-# 入力サンプルレート（デバイス実レート）。config.sh 未設定なら 48000 を既定にする。
-INPUT_RATE="${INPUT_RATE:-48000}"
-
 # ===== NASマウント確認（手動マウント前提・自動マウントはしない）=====
 if ! "$SCRIPT_DIR/ensure_nas.sh"; then
   echo "$(date '+%F %T') ERROR: NAS未マウント。録音中止。手動でマウントしてください。" >&2
@@ -30,14 +27,12 @@ fi
 # -segment_atclocktime 1 : 壁時計の毎時00分で区切る
 # -strftime 1            : ファイル名に開始時刻を埋め込む
 #
-# 【v1.1 修正】入力サンプルレートを -i の前で明示する（-ar "$INPUT_RATE"）。
-#   avfoundation はデバイス固有レート（多くは 44100/48000）で音声を渡すため、
-#   入力レートを宣言せずに出力側 -ar 16000 だけを指定すると、リサンプルが
-#   正しく効かず等速コピー扱いになり、再生が短く・早口（ピッチ上昇）になる。
-#   例: 実 48000 を 16000 と誤認 → 60分が 48分(=16000/20000相当のズレ)に。
-#   入力=INPUT_RATE を宣言 → 出力=16000 で正しくリサンプルされる。
+# 【v1.1】avfoundation は入力サンプルレートを指定できない（デバイス固有レートで受ける）。
+#   出力 -ar 16000 だけに頼ると環境によりリサンプルが効かず、再生が短く・早口になる
+#   ことがあった。出力直前に aresample=16000 を明示し、確実に16kHz mono へ変換する。
 ffmpeg -nostdin -hide_banner -loglevel warning \
-  -f avfoundation -ar "$INPUT_RATE" -i "$AUDIO_DEVICE" \
+  -f avfoundation -i "$AUDIO_DEVICE" \
+  -af "aresample=16000" \
   -ac 1 -ar 16000 -codec:a libmp3lame -b:a 128k \
   -f segment -segment_time "$SEG_SECONDS" \
   -segment_atclocktime 1 \
