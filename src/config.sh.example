@@ -21,6 +21,11 @@ NAS_SHARE="//USER@NAS_IP/SHARE"
 # `ffmpeg -f avfoundation -list_devices true -i ""` で確認した音声デバイス番号
 AUDIO_DEVICE=":1"
 
+# 録音の一次書き込み先（内蔵ディスク）。
+# NAS(SMB)へ直接録音すると書き込みの詰まりで音声を取りこぼすため、必ずローカルに録る。
+# 完成したセグメントは mover.sh が NAS の recordings/ へ移送する。
+LOCAL_REC_DIR="$BASE/recordings_local"
+
 # ----- 録音設定 -----
 SEG_SECONDS=3600                 # 1ファイルの長さ（秒）。3600=1時間
 CHUNK_SECONDS=600                # whisper分割処理の1チャンク長（秒）
