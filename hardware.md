@@ -60,8 +60,12 @@ stenobot は AMラジオの音声を Mac mini に入力して録音します。�
 
 ### 5. Mac mini（録音ホスト）
 
-- macOS の `avfoundation` 経由で録音します。常時稼働を想定するため、スリープを無効化します
-  （[implementation_guide.md](implementation_guide.md) の macOS 設定を参照）。
+- macOS の CoreAudio 経由（`sox`）で録音します。常時稼働を想定するため、`pmset` で
+  スリープを無効化しておきます。
+
+```bash
+sudo pmset -a sleep 0 disksleep 0
+```
 
 ---
 
@@ -71,8 +75,10 @@ stenobot は AMラジオの音声を Mac mini に入力して録音します。�
 2. アイソレーターの出力を、USBオーディオIF（SB-PLAY3）のライン/マイク入力に挿します。
 3. USBオーディオIFを Mac mini のUSBポートに接続します。
 4. ラジオの給電は、**Mac とは別の**ACアダプターから取ります（USB給電の場合）。
-5. `ffmpeg -f avfoundation -list_devices true -i ""` で音声デバイス番号を確認し、
-   `config.sh` の `AUDIO_DEVICE` に設定します（USB機器の抜き挿しで番号が変わることがあります）。
+5. **システム設定 → サウンド → 入力**で、このUSBオーディオIFを選択します。
+   stenobot はデフォルト入力デバイスから録音するため、この設定が録音対象を決めます
+   （USB機器の抜き挿しやスリープ復帰で変わることがあるので、録音が想定と違うときは
+   まずここを確認します）。
 
 ---
 
@@ -132,23 +138,41 @@ stenobot は AMラジオの音声を Mac mini に入力して録音します。�
 
 ---
 
-## サンプルレートの確認（v1.1）
+## 入力デバイスの設定と確認（v1.3）
 
 USBオーディオIFは機種ごとに固有のサンプルレートを持ちます（SB-PLAY3 等は 44100 または
-48000 Hz が一般的）。`avfoundation` はこの固有レートで音声を渡すため、録音側で正しく
-16kHzへ変換しないと、再生が短く・早口（ピッチ上昇）になる症状が出ます。
+48000 Hz が一般的）。stenobot は **48000 Hz ステレオ**で取り込み、16kHzモノラルへの変換は
+後段の `ffmpeg` が行います。
 
-`avfoundation` は入力サンプルレートを指定するオプションを持たない（`-ar` を `-i` の前に
-置くと `Option sample_rate not found` で失敗する）ため、stenobot は recorder.sh の出力側
-フィルタ `-af "aresample=16000"` でリサンプルします。`config.sh` の `INPUT_RATE` は
-確認・記録用のメモです。
+取り込みは `sox`（CoreAudio）が担当します。sox の CoreAudio ドライバは**デバイス名の指定が
+効かない**ため（`'Sound Blaster Play! 3'` を指定すると
+`can not get audio device properties` で失敗）、**システムのデフォルト入力デバイス**から
+録音します。
+
+**システム設定 → サウンド → 入力**で、使用するオーディオIFを選択してください。ここが
+別のデバイス（内蔵マイク、仮想オーディオドライバ等）になっていると、そちらを録ってしまいます。
+USBの抜き挿しやスリープ復帰で変わることがあるため、録音が想定と違うときはまずここを疑います。
 
 ```bash
-# デバイス番号を確認
+# デバイス一覧（参考。sox では番号指定できないが、接続確認には使える）
 ffmpeg -f avfoundation -list_devices true -i ""
-# 数秒録って実レートを確認（ログの "... Hz"）
-ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 /tmp/test.wav
+
+# デフォルト入力デバイスから3秒録って、レートと音量を確認
+rec -c 2 -r 48000 /tmp/test.wav trim 0 3
+ffmpeg -i /tmp/test.wav -af volumedetect -f null - 2>&1 | grep -E "mean_volume|max_volume"
+#   mean_volume が -91dB 前後 → 無音。デバイス選択かマイク権限を確認
+#   mean_volume が -30dB 前後 → 正常
 ```
+
+> **`ffmpeg -f avfoundation` で録音してはいけません。**
+> 常にサンプルの15〜19%を落とします（同一デバイスで sox は100%取得）。v1.1 / v1.2 で
+> 「サンプルレート不一致」と説明していた症状の真因はこれでした。詳細は
+> [README のトラブルシュート](README.md#録音が60分に満たない場合)を参照してください。
+
+> **入力レベルの目安**
+> `mean_volume` が -30dB 前後、`max_volume` が -12dB 前後になるよう、macOS の入力ゲインと
+> ラジオ側の音量で調整します。max_volume が 0dB に近いとクリップ（歪み）し、文字起こしの
+> 精度が落ちます。
 
 ---
 

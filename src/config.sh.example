@@ -18,22 +18,23 @@ BASE="$HOME/radio"
 NAS_SHARE="//USER@NAS_IP/SHARE"
 
 # ----- 音声入力デバイス -----
-# `ffmpeg -f avfoundation -list_devices true -i ""` で確認した音声デバイス番号
-AUDIO_DEVICE=":1"
+# v1.3 以降、取り込みは sox(rec) が行う。sox の CoreAudio ドライバはデバイス名指定が
+# 効かない（"can not get audio device properties" で失敗する）ため、
+# **システムのデフォルト入力デバイス**から録る。
+#   → システム設定 → サウンド → 入力 を目的のオーディオIFにしておくこと。
+#   → 設定ファイルでデバイスを指定することはできない。
+# 取り違えは recorder.sh の起動時チェック（無音判定）が検知する。
 
 # 録音の一次書き込み先（内蔵ディスク）。
-# NAS(SMB)へ直接録音すると書き込みの詰まりで音声を取りこぼすため、必ずローカルに録る。
+# NAS(SMB)へ直接録音すると、NASが詰まった際に録音まで巻き込まれる。
 # 完成したセグメントは mover.sh が NAS の recordings/ へ移送する。
 LOCAL_REC_DIR="$BASE/recordings_local"
 
 # ----- 録音設定 -----
 SEG_SECONDS=3600                 # 1ファイルの長さ（秒）。3600=1時間
 CHUNK_SECONDS=600                # whisper分割処理の1チャンク長（秒）
-# 入力デバイスの実サンプルレート（Hz）。SB-PLAY3 等は 44100 か 48000 が多い。
-# 注意: avfoundation は入力レートを指定できないため、この値は確認・記録用のメモ。
-# 実際の変換は recorder.sh の aresample=16000 が行う（whisper.cpp が16kHz前提）。
-# `ffmpeg -f avfoundation -i "$AUDIO_DEVICE" -t 5 test.wav` のログの "... Hz" で確認。
-INPUT_RATE=48000
+# 取り込みは 48000Hz ステレオ固定（recorder.sh 内で指定）。
+# 16kHzモノラルへの変換は後段の ffmpeg が行う（whisper.cpp が16kHz前提）。
 
 # ----- whisper モデル -----
 MODEL_WHISPER="$BASE/models/ggml-large-v3-turbo.bin"
