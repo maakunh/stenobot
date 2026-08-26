@@ -103,8 +103,18 @@ mount_smbfs //USER@NAS_IP/SHARE ~/radio_nas   # Password: と表示されたら�
 > **NAS の手動マウントについて**
 > stenobot は NAS を自動マウントしません。**OS 起動後（および再起動・スリープ復帰でマウントが
 > 外れた後）は、都度この `mount_smbfs` を手動実行してパスワードを入力する**のが標準手順です。
-> マウントが済んでいないと録音・解析は開始されません（`ensure_nas.sh` がマウント済み＋書き込み可を
-> 確認します）。マウント確認は `mount | grep radio_nas` で行えます。
+> マウント確認は `mount | grep radio_nas` で行えます。
+>
+> **録音は NAS 未マウントでも継続します。** 録音先は内蔵ディスクで、完成したセグメントを
+> `mover.sh` がNASへ移送する構成のためです。マウントを忘れても録音データは失われず、
+> 移送と解析が待機するだけで、マウントすれば自動で追いつきます。滞留が続くと
+> `mover.sh` が警告メールを送ります。
+>
+> 自動マウントは断念しました。`mount_smbfs -N` は Keychain ではなく `~/.nsmbrc` から
+> パスワードを読みますが（Keychain を使うのは Finder が経由する NetFS 側で別系統）、
+> 現行 macOS では `~/.nsmbrc` 用の難読化コマンド `smbutil crypt` が削除されており、
+> **平文でパスワードを置く以外の選択肢がありません**。再起動の頻度を考えると
+> 割に合わないと判断しました。
 
 ## スクリプト構成
 
@@ -119,7 +129,63 @@ mount_smbfs //USER@NAS_IP/SHARE ~/radio_nas   # Password: と表示されたら�
 | `format_transcript.sh` | 1分毎タイムスタンプ整形 |
 | `run_analyzer.sh` | 解析ラッパー＋古いファイルの自動削除 |
 | `analyzer_loop.sh` | 5分毎に解析を回すループ |
-| `start_all.sh` / `stop_all.sh` | 一括起動 / 一括停止 |
+| `start_all.sh` / `stop_all.sh` | 一括起動 / 一括停止（手動運用時） |
+| `install_launchagents.sh` | LaunchAgent として登録し、ログイン時に自動起動させる |
+
+## LaunchAgent での常駐運用（推奨）
+
+`install_launchagents.sh` を実行すると、録音・移送・解析を macOS の LaunchAgent として
+登録します。手動起動（`start_all.sh`）より優れている点が3つあります。
+
+**ログイン時に自動起動し、クラッシュしても自動復帰します**（`KeepAlive`）。個別に監視される
+ため、「移送だけが死んでいるのに気づかない」という事態を防げます。
+
+**SSH からでも安全に再起動できます。** これが最大の利点です。SSH から `recorder.sh` を直接
+起動すると macOS がマイクへのアクセスを拒否し、エラーを返さないまま無音を録り続けます
+（[詳細](#最も多い原因ssh経由での起動)）。LaunchAgent は GUI ログインセッションの文脈で動く
+ため、`launchctl kickstart` で再起動してもマイク権限が維持されます。
+
+**ログが切り詰められません。** launchd の出力は追記されるため、再起動で過去のログを失いません。
+
+```bash
+./install_launchagents.sh              # 登録（再実行で更新）
+./install_launchagents.sh --status     # 状態確認
+./install_launchagents.sh --uninstall  # 登録解除
+```
+
+登録後の操作：
+
+```bash
+U=$(id -u)
+launchctl kickstart -k gui/$U/com.stenobot.recorder   # 再起動
+launchctl print gui/$U/com.stenobot.mover             # 詳細
+```
+
+> **スクリプトは `$BASE`（内蔵ディスク）に置かれます**
+> ログイン直後はまだNASがマウントされていないため、NAS上のスクリプトはLaunchAgentから
+> 起動できません。`install_launchagents.sh` がスクリプト一式を `$BASE` へ配置します。
+> NASはデータ専用になります。
+
+### macOS の権限設定（必須）
+
+LaunchAgent が起動する `/bin/bash` に、**フルディスクアクセス**を与える必要があります。
+これが無いと、NAS（ネットワークボリューム）への書き込みが `Operation not permitted` で
+失敗します。エラーは `mover.err` にしか出ないため気づきにくい失敗です。
+
+システム設定 → プライバシーとセキュリティ → フルディスクアクセス → `+` →
+`Cmd+Shift+G` で `/bin/bash` を指定して追加し、トグルをオンにします。追加後は
+エージェントの再起動が必要です（TCCの許可はプロセス起動時に読まれるため）。
+
+拒否されているかはログで確認できます。
+
+```bash
+log show --last 20m --predicate 'subsystem == "com.apple.TCC"' --info | grep -i NetworkVolumes
+```
+
+`Auth Right: Unknown (None)` と出ていれば未許可です。
+
+> `/bin/bash` へのフルディスクアクセスは、このMacで実行される**すべてのbashスクリプト**に
+> 同じ権限を与えます。録音専用機であれば実用上の問題は小さいですが、汎用機では留意してください。
 
 ## データ保持方針
 
@@ -282,6 +348,31 @@ ls -la ~/radio/recordings_local          # 滞留しているファイル
 tail -20 ~/radio/mover.err               # タイムアウトや再マウントの記録
 ```
 
+### macOS の権限（TCC）でつまずきやすい3点
+
+本システムは macOS のプライバシー保護（TCC）に3箇所で引っかかります。いずれも
+**エラーが分かりにくい形で出る**のが共通点で、切り分けに時間がかかります。
+
+| 対象 | 症状 | 対処 |
+|---|---|---|
+| マイク | SSH起動時、エラーなく**全編無音**が録れる | LaunchAgent 経由で起動する |
+| ネットワークボリューム | NASへの書き込みが `Operation not permitted` | `/bin/bash` にフルディスクアクセス |
+| Desktop/Documents 等 | 実在するファイルが「無い」ように見える | 該当アプリにフルディスクアクセス |
+
+いずれも共通のログで確認できます。
+
+```bash
+log show --last 30m --predicate 'subsystem == "com.apple.TCC"' --info | grep -iE 'microphone|NetworkVolumes'
+```
+
+3つ目は、SMB共有を読むツール側で起きます。**共有が正常でもファイルが見えなくなる**ため、
+「ファイルが消えた」と誤診しやすい点に注意してください。判断の前に、書き込みテストで
+マウントの健全性を確かめるのが確実です。
+
+```bash
+touch ~/radio_nas/.wtest && rm ~/radio_nas/.wtest && echo "マウント正常"
+```
+
 ## 変更履歴
 
 - **v1.3** — **録音が60分に満たない問題を解決**。原因は `ffmpeg` の `avfoundation` 音声
@@ -291,6 +382,12 @@ tail -20 ~/radio/mover.err               # タイムアウトや再マウント�
   録音が止まらない）、`mover.sh` にNAS I/Oハング対策のタイムアウトを追加、
   起動時の無音チェックとSSH起動ガードを追加。
   v1.1 の「サンプルレート不一致」という診断は誤りだったため、該当箇所を訂正。
+  さらに LaunchAgent での常駐運用（`install_launchagents.sh`）を追加。ログイン時の
+  自動起動、クラッシュ時の自動復帰に加え、**SSHからでも安全に再起動できる**ようになった
+  （LaunchAgent はGUIログインセッションの文脈で動くため、マイク権限が維持される）。
+  NASの自動マウントは、平文パスワードを避ける判断から見送り。`ensure_nas.sh` は
+  マウント操作を行わない「確認のみ」に統一（再マウントできない状況で正常なマウントを
+  破壊する問題があったため）。
 - **v1.2** — 通知メールの各話題に「分野」を追加（話の内容から分野を一言で表記、複数は
   カンマ区切り）。Gemini 要約フォーマットに `話題N分野` を追加。
 - **v1.1** — 録音のサンプルレート不一致を修正（出力直前に `aresample=16000` を明示し、

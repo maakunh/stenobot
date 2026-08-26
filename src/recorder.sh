@@ -5,9 +5,10 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/config.sh"
-REC_DIR="$NAS/recordings"                                  # 最終保管先（mover.sh が移送）
 LOCAL_REC_DIR="${LOCAL_REC_DIR:-$BASE/recordings_local}"   # 録音の一次書き込み先（内蔵ディスク）
 MIN_FREE_KB=$((5*1024*1024))                               # 5GB
+WARN_COOLDOWN=3600                                         # 同種の警告メールを再送するまでの秒数
+WARN_DIR="$BASE/.warn"
 
 # ===== 取り込みは sox(rec) を使う ==========================================
 # 【2026-08-21 判明】ffmpeg の avfoundation 音声取り込みは、常にサンプルの
@@ -20,63 +21,80 @@ MIN_FREE_KB=$((5*1024*1024))                               # 5GB
 #     rec (sox/CoreAudio)               60秒の実時間で  60.000秒 (100%)
 #     rec | ffmpeg (この構成)          600秒の実時間で 599.976秒 (99.996%)
 #
-#   切り分けの過程で潰した仮説（いずれも無効だった）:
-#     - NAS(SMB)への直接書き込みが詰まっている → 内蔵ディスクでも 81.9%
-#     - リサンプル48k→16k / モノラル化が重い   → ネイティブPCMでも 83.5%
-#     - mp3エンコードが重い                     → PCMでも変わらず
-#     - -thread_queue_size が小さい             → 4096でも 83.2%
-#     - バックグラウンド実行のQoS低下           → フォアグラウンドでも 81.2%
-#
 #   注意: ffmpeg の "time=" 表示はタイムスタンプ基準であってサンプル数ではない。
 #         損失の有無は必ず出力バイト数か ffprobe の duration で確認すること。
-#         （この見落としで長く原因を取り違えた）
-#
-#   よって取り込みだけを sox に置き換え、分割・命名・mp3化は従来どおり ffmpeg に
-#   任せる。mover.sh / mark_done.sh / analyzer.sh は無変更で動く。
 #
 # 【注意】sox の CoreAudio ドライバはデバイス名指定が効かない
-#   （'Sound Blaster Play! 3' を指定すると "can not get audio device
-#   properties" で失敗する）。そのため **システムのデフォルト入力デバイス**
-#   から録る。システム設定 → サウンド → 入力 を録音したいデバイスにしておくこと。
-#   取り違えは下の起動時チェック（無音判定）で検知する。
+#   （"can not get audio device properties" で失敗する）。そのため
+#   **システムのデフォルト入力デバイス**から録る。
+#   システム設定 → サウンド → 入力 を目的のオーディオIFにしておくこと。
+#   取り違えは下の起動時チェック（無音判定）が検知する。
 #
-# 【注意】起動はSSH経由では不可。SSHセッションから起動すると macOS が
-#   マイクへのアクセスを拒否し("Policy disallows prompt")、エラーではなく
-#   全ゼロの無音が録れる。必ず画面共有か本体の画面上のTerminalから起動する。
-#   start_all.sh にSSH起動を拒否するガードを入れてある。
+# 【注意】マイク権限（TCC）について
+#   SSHセッションから直接起動すると macOS がマイクへのアクセスを拒否し
+#   （"Policy disallows prompt"）、エラーではなく全ゼロの無音が録れる。
+#   LaunchAgent 経由（launchctl kickstart 含む）ならGUIログインセッションの
+#   文脈で動くため、SSHから操作しても問題ない。
+#   → install_launchagents.sh でのLaunchAgent運用を推奨。
+#   手動で直接起動する場合は画面共有か本体の画面上のTerminalから行うこと。
 # ==========================================================================
 
-# ===== NASマウント確認（手動マウント前提・自動マウントはしない）=====
-if ! "$SCRIPT_DIR/ensure_nas.sh"; then
-  echo "$(date '+%F %T') ERROR: NAS未マウント。録音中止。手動でマウントしてください。" >&2
-  printf 'Subject: [警告] NAS未マウントで録音停止\nTo: %s\nFrom: %s\n\nNASがマウントされていないため録音を開始できませんでした。手動でマウントしてください。\n' \
-    "$MAIL_TO" "$MAIL_FROM" | msmtp "$MAIL_TO" 2>/dev/null || true
-  exit 1
+mkdir -p "$LOCAL_REC_DIR" "$WARN_DIR"
+
+# 同種の警告メールを連発しない。$1=種別キー $2=件名 $3=本文
+# LaunchAgent の KeepAlive で再起動を繰り返す場合、これが無いと
+# 起動のたびに警告メールが飛ぶ。
+warn_once() {
+  local key="$1" subject="$2" body="$3" stamp last now
+  stamp="$WARN_DIR/$key"
+  now=$(date '+%s'); last=0
+  [[ -f "$stamp" ]] && last=$(cat "$stamp" 2>/dev/null || echo 0)
+  (( now - last < WARN_COOLDOWN )) && return 0
+  printf 'Subject: %s\nTo: %s\nFrom: %s\n\n%s\n' \
+    "$subject" "$MAIL_TO" "$MAIL_FROM" "$body" | msmtp "$MAIL_TO" 2>/dev/null || true
+  echo "$now" > "$stamp"
+}
+
+# ===== NASマウント確認（警告のみ・録音は継続）=====
+# 録音先は内蔵ディスクなのでNASは不要。NASが無くても録音は続け、
+# 移送は mover.sh がNAS復旧後に自動で追いつく。
+# （ここで exit すると、LaunchAgentのKeepAliveでログイン直後の
+#   マウント前に無限再起動になってしまう）
+if ! "$SCRIPT_DIR/ensure_nas.sh" >/dev/null 2>&1; then
+  echo "$(date '+%F %T') WARN: NAS未マウント。録音はローカルに継続し、移送は mover.sh に任せる。" >&2
+  warn_once nas_unmounted "[警告] NAS未マウント（録音は継続）" \
+    "NASがマウントされていないため、録音ファイルをNASへ移送できません。録音は内蔵ディスクに継続しています。手動でマウントすれば mover.sh が自動で追いつきます。"
 fi
-mkdir -p "$LOCAL_REC_DIR"
 
 # ===== 空き容量チェック（警告のみ・録音は継続）=====
 AVAIL_KB=$(df -k "$LOCAL_REC_DIR" | awk 'NR==2{print $4}')
 if (( AVAIL_KB < MIN_FREE_KB )); then
-  printf 'Subject: [警告] 内蔵ディスク空き容量不足（録音先）\nTo: %s\nFrom: %s\n\n録音先 %s の空き容量が5GB未満です。移送(mover.sh)が停止していないか確認してください。\n' \
-    "$MAIL_TO" "$MAIL_FROM" "$LOCAL_REC_DIR" | msmtp "$MAIL_TO" || true
-fi
-AVAIL_NAS_KB=$(df -k "$NAS" | awk 'NR==2{print $4}')
-if (( AVAIL_NAS_KB < 5*1024*1024 )); then
-  printf 'Subject: [警告] NAS空き容量不足\nTo: %s\nFrom: %s\n\nNASの空き容量が5GB未満です。\n' \
-    "$MAIL_TO" "$MAIL_FROM" | msmtp "$MAIL_TO" || true
+  warn_once disk_low "[警告] 内蔵ディスク空き容量不足（録音先）" \
+    "録音先 $LOCAL_REC_DIR の空き容量が5GB未満です。移送(mover.sh)が停止していないか確認してください。"
 fi
 
 # ===== 起動時チェック：3秒録って「音が入っているか」を確かめる ==========
-# これが無いと、下記のどちらでもエラーが出ないまま無音を録り続けてしまう。
-#   - SSH起動によりマイク権限が拒否された場合（全ゼロが実時間ちょうどで返る）
+# これが無いと、下記のどれでもエラーが出ないまま無音を録り続けてしまう。
+#   - マイク権限が拒否された場合（全ゼロが実時間ちょうどで返る）
 #   - デフォルト入力デバイスが別のものに変わっていた場合
+#   - 受信機の電源が落ちている場合
 CHECK_WAV="$LOCAL_REC_DIR/.startup_check.wav"
 rm -f "$CHECK_WAV"
-if ! rec -q -c 2 -r 48000 "$CHECK_WAV" trim 0 3 2>/dev/null || [[ ! -s "$CHECK_WAV" ]]; then
-  echo "$(date '+%F %T') ERROR: 起動時チェックの録音に失敗しました。" >&2
-  printf 'Subject: [警告] 録音開始前チェックに失敗\nTo: %s\nFrom: %s\n\nrec(sox)での試し録りに失敗したため録音を開始しませんでした。入力デバイスを確認してください。\n' \
-    "$MAIL_TO" "$MAIL_FROM" | msmtp "$MAIL_TO" 2>/dev/null || true
+# rec の標準エラーは捨てずに記録する。捨てていたために
+# 「デバイスが開けない」のか「権限が無い」のかを切り分けられなかった。
+REC_ERR=$(rec -q -c 2 -r 48000 "$CHECK_WAV" trim 0 3 2>&1)
+REC_RC=$?
+if (( REC_RC != 0 )) || [[ ! -s "$CHECK_WAV" ]]; then
+  echo "$(date '+%F %T') ERROR: 起動時チェックの録音に失敗しました (rc=${REC_RC}): ${REC_ERR:-出力なし}" >&2
+  warn_once rec_failed "[警告] 録音開始前チェックに失敗" \
+    "rec(sox)での試し録りに失敗したため録音を開始しませんでした。
+
+rc=${REC_RC}
+${REC_ERR:-（エラー出力なし）}
+
+確認してください:
+ - マイク権限（システム設定→プライバシーとセキュリティ→マイク）
+ - システム設定→サウンド→入力 のデバイス選択"
   rm -f "$CHECK_WAV"
   exit 1
 fi
@@ -86,11 +104,18 @@ rm -f "$CHECK_WAV"
 # 無音(デジタルゼロ)は -91dB。-80dB より小さければ音が来ていないとみなす。
 if [[ -z "$MEANVOL" ]] || awk -v v="$MEANVOL" 'BEGIN{exit !(v < -80)}'; then
   echo "$(date '+%F %T') ERROR: 入力が無音です(mean_volume=${MEANVOL:-取得失敗}dB)。録音を開始しません。" >&2
-  printf 'Subject: [警告] 入力が無音のため録音を開始しませんでした\nTo: %s\nFrom: %s\n\n試し録りの音量が %s dB でした（無音は約-91dB）。\n\n確認してください:\n - SSH経由で起動していないか（マイク権限が拒否され無音になります）\n - システム設定→サウンド→入力 が録音したいデバイスになっているか\n - 受信機の電源とケーブル\n' \
-    "$MAIL_TO" "$MAIL_FROM" "${MEANVOL:-取得失敗}" | msmtp "$MAIL_TO" 2>/dev/null || true
+  warn_once silent_input "[警告] 入力が無音のため録音を開始しませんでした" \
+    "試し録りの音量が ${MEANVOL:-取得失敗} dB でした（無音は約-91dB）。
+
+確認してください:
+ - マイク権限（SSHから直接起動していないか）
+ - システム設定→サウンド→入力 が目的のオーディオIFになっているか
+ - 受信機の電源とケーブル"
   exit 1
 fi
 echo "$(date '+%F %T') 起動時チェックOK (mean_volume=${MEANVOL}dB)。録音を開始します。"
+# 正常に開始できたので、無音・録音失敗の警告履歴はリセットする
+rm -f "$WARN_DIR/silent_input" "$WARN_DIR/rec_failed"
 
 # ===== 録音本体（途切れないセグメント録音）=====
 # rec(sox) がデバイスから取り込み、生PCMをパイプで ffmpeg へ渡す。
