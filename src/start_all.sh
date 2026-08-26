@@ -24,12 +24,18 @@ if ! "$SCRIPT_DIR/ensure_nas.sh"; then
   exit 1
 fi
 
+# ログはすべて追記（>>）で開く。切り詰め（>）にすると起動のたびに前回のログが
+# 消え、障害の追跡ができなくなる。実際に、移送が止まった原因を調べようとした際、
+# 再起動でログが消えていて経緯を追えなかったことがある。
+# LaunchAgent 運用（install_launchagents.sh）では launchd が追記するため、
+# この問題は起きない。
+
 # 2) 二重起動防止：既存プロセスがあれば起動しない
 if pgrep -f "segment.*radio_" >/dev/null; then
   echo "録音プロセスは既に起動しています。"
 else
   echo "録音を起動します..."
-  nohup "$SCRIPT_DIR/recorder.sh" < /dev/null > "$BASE/recorder.out" 2> "$BASE/recorder.err" &
+  nohup "$SCRIPT_DIR/recorder.sh" < /dev/null >> "$BASE/recorder.out" 2>> "$BASE/recorder.err" &
   disown
 fi
 
@@ -38,7 +44,7 @@ if pgrep -f "mover.sh" >/dev/null; then
   echo "移送ループは既に起動しています。"
 else
   echo "移送ループを起動します..."
-  nohup "$SCRIPT_DIR/mover.sh" < /dev/null > "$BASE/mover.out" 2> "$BASE/mover.err" &
+  nohup "$SCRIPT_DIR/mover.sh" < /dev/null >> "$BASE/mover.out" 2>> "$BASE/mover.err" &
   disown
 fi
 
