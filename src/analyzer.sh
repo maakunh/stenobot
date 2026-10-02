@@ -28,17 +28,6 @@ if [[ -z "$CLAUDE_API_KEY" ]]; then
   exit 1
 fi
 
-# Gemini APIキーの読み込み（専用ファイル・chmod 600）
-if [[ ! -r "$GEMINI_KEY_FILE" ]]; then
-  echo "$(date '+%F %T') ERROR: Gemini APIキーファイルが読めません: $GEMINI_KEY_FILE" >&2
-  exit 1
-fi
-GEMINI_API_KEY=$(tr -d ' \t\r\n' < "$GEMINI_KEY_FILE")
-if [[ -z "$GEMINI_API_KEY" ]]; then
-  echo "$(date '+%F %T') ERROR: Gemini APIキーが空です: $GEMINI_KEY_FILE" >&2
-  exit 1
-fi
-
 # ===== Claude API 呼び出し共通関数 =====
 # 使い方: claude_call <model> <max_tokens> <prompt文字列>
 #   成功: 標準出力に応答テキスト、戻り値0
@@ -59,62 +48,15 @@ claude_call() {
       -H "content-type: application/json" \
       -d "$req" 2>/dev/null) || resp=""
 
-    text=$(printf '%s' "$resp" | jq -r '.content[0].text // empty' 2>/dev/null)
+    # 応答の text ブロックを連結して取り出す。Sonnet 5.5 等は思考が常時有効で、
+    # content[0] が thinking ブロックになるため、先頭だけを読むと毎回失敗扱いになる。
+    text=$(printf '%s' "$resp" | jq -r '[.content[]? | select(.type=="text") | .text] | join("")' 2>/dev/null)
     if [[ -n "$text" ]]; then
       printf '%s' "$text"
       return 0
     fi
     errmsg=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)
     echo "$(date '+%F %T') Claude API(${model}) 試行${attempt}失敗: ${errmsg:-応答なし/解析不可}" >&2
-    sleep $(( attempt * 5 ))
-  done
-  return 1
-}
-
-# ===== Gemini API 呼び出し関数（Google検索グラウンディング有効・要約に使用）=====
-# 使い方: gemini_call <max_tokens> <prompt文字列>
-#   成功: 標準出力に応答テキスト、戻り値0 / 失敗: 空、戻り値1（最大3回リトライ後）
-gemini_call() {
-  local max_tokens="$1"; local prompt="$2"
-  local url req resp text errmsg attempt
-  url="https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent"
-  # google_search ツールを有効化して検索グラウンディング。本文プロンプトはjqで安全に組み立て。
-  req=$(jq -n \
-    --arg prompt "$prompt" \
-    --argjson maxtok "$max_tokens" \
-    '{
-       contents: [ { role:"user", parts:[ { text:$prompt } ] } ],
-       tools: [ { google_search: {} } ],
-       generationConfig: { maxOutputTokens: $maxtok }
-     }')
-
-  for attempt in 1 2 3; do
-    resp=$(curl -sS --max-time 180 "$url" \
-      -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-      -H "Content-Type: application/json" \
-      -d "$req" 2>/dev/null) || resp=""
-
-    # candidates[0].content.parts[].text を連結して取り出す
-    text=$(printf '%s' "$resp" \
-      | jq -r '.candidates[0].content.parts[]?.text // empty' 2>/dev/null \
-      | sed '/^$/d')
-    # 生成終了理由を確認（STOP=正常 / MAX_TOKENS=上限切れ=途切れ）
-    finish=$(printf '%s' "$resp" | jq -r '.candidates[0].finishReason // empty' 2>/dev/null)
-
-    if [[ -n "$text" ]]; then
-      if [[ "$finish" == "MAX_TOKENS" ]]; then
-        # 上限で途切れた。リトライ余地があれば次の試行へ、無ければ途切れたまま返す
-        echo "$(date '+%F %T') Gemini出力が上限(MAX_TOKENS)で途切れました。GEMINI_MAX_TOKENS_SUMの引き上げを検討してください。" >&2
-        if (( attempt < 3 )); then
-          sleep $(( attempt * 5 ))
-          continue
-        fi
-      fi
-      printf '%s' "$text"
-      return 0
-    fi
-    errmsg=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)
-    echo "$(date '+%F %T') Gemini API(${GEMINI_MODEL}) 試行${attempt}失敗: ${errmsg:-応答なし/解析不可}" >&2
     sleep $(( attempt * 5 ))
   done
   return 1
@@ -217,7 +159,6 @@ for marker in $(ls -tr "$REC_DIR"/radio_*.mp3.done 2>/dev/null); do
 
   CORRECTED_TXT="$CORRECTED_DIR/radio_${STAMP}_corrected.txt"
 
-  # ===== 第1段：Gemini(検索グラウンディング)で文字起こしを校正（行ブロック分割・1分毎TSを維持）=====
   # ===== 第1段：Haikuで文字起こしを校正（行ブロック分割・欠落防止ガード付き）=====
   # ヘッダ（# で始まる）と空行を除いた本文行のみ抽出。各行は「YYYY-MM-DD-HH-MM-SS  本文」。
   RAW_BODY=$(grep -v '^#' "$TRANSCRIPT_TXT" | sed '/^$/d')
@@ -288,9 +229,9 @@ ${BLOCK_OUT}"
     printf '%s\n' "$CORRECTED_BODY"
   } > "$CORRECTED_TXT"
 
-  # ===== 第2段：修正済みテキストをGemini(検索グラウンディング)で要約しメール文面を作成 =====
-  SUM_PROMPT="あなたはAMラジオ番組の内容を簡潔にまとめる編集者です。必要に応じてGoogle検索を使い、番組で言及された固有名詞・時事的な出来事の背景を確認して、正確な要約を作成してください。
-以下は校正済みの文字起こし（各行先頭に時刻）です。これを読み、厳密に次のフォーマットで日本語出力してください。前置きや感想、検索結果の引用・脚注は不要です。
+  # ===== 第2段：修正済みテキストをClaude Sonnetで要約しメール文面を作成 =====
+  SUM_PROMPT="あなたはAMラジオ番組の内容を簡潔にまとめる編集者です。番組で語られた内容に基づいて、正確な要約を作成してください。
+以下は校正済みの文字起こし（各行先頭に時刻）です。これを読み、厳密に次のフォーマットで日本語出力してください。前置きや感想、脚注は不要です。
 
 番組名: <推定される番組名。判らなければ「不明」>
 全体概要: <番組全体を3〜4文で要約>
@@ -299,7 +240,7 @@ ${BLOCK_OUT}"
 話題1名: <短い見出し>
 話題1分野: <その話題がどの分野の話かを一言で表す（例: 経済, 政治, 国際, スポーツ, 科学, 健康, 芸能, 文化, 生活, 天気, 交通）。複数にまたがる場合はカンマ区切りで複数併記（例: 経済, 国際）>
 話題1時刻: <その話題が始まる時刻 HH:MM 目安>
-話題1詳細: <2〜3文の要約。固有名詞や時事はGoogle検索で確認した正確な情報を反映>
+話題1詳細: <2〜3文の要約>
 ---
 話題2名: <短い見出し>
 話題2分野: <一言。複数はカンマ区切り>
@@ -311,9 +252,9 @@ ${BLOCK_OUT}"
 --- 校正済み文字起こし ---
 ${CORRECTED_BODY}"
 
-  if ! ANALYSIS=$(gemini_call "$GEMINI_MAX_TOKENS_SUM" "$SUM_PROMPT"); then
+  if ! ANALYSIS=$(claude_call "$CLAUDE_MODEL_SUM" "$CLAUDE_MAX_TOKENS_SUM" "$SUM_PROMPT"); then
     ANALYSIS="番組名: 不明
-全体概要: （Gemini APIでの要約に失敗しました。修正済み文字起こしは添付パスを参照してください）
+全体概要: （Claude APIでの要約に失敗しました。修正済み文字起こしは添付パスを参照してください）
 話題数: 0"
   fi
 

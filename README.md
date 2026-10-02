@@ -4,7 +4,7 @@
 
 AMラジオを Mac mini で**連続録音**し、**文字起こし → AI校正 → AI要約 → メール通知**まで自動化するパイプラインです。
 
-録音した音声を [whisper.cpp](https://github.com/ggerganov/whisper.cpp) で文字起こしし、**Claude（Haiku）** で校正、**Gemini 3.5 Flash（Google検索グラウンディング）** で要約して、番組名・概要・話題をまとめたメールを送ります。録音・文字起こしデータは NAS に保管します。
+録音した音声を [whisper.cpp](https://github.com/ggerganov/whisper.cpp) で文字起こしし、**Claude Haiku** で校正、**Claude Sonnet 5.5** で要約して、番組名・概要・話題をまとめたメールを送ります。録音・文字起こしデータは NAS に保管します。
 
 > 個人利用を想定した自動化スクリプト集です。録音物の取り扱いは各自の責任で、著作権法および放送局の利用規約を遵守してください（[注意事項](#注意事項)参照）。
 
@@ -24,7 +24,7 @@ AMラジオを Mac mini で**連続録音**し、**文字起こし → AI校正 
 - **長時間音声でも切れない**: 文字起こしはチャンク分割、校正は行ブロック分割で全編を確実に処理。
 - **2段のAIパイプライン**:
   - 第1段（校正）= **Claude Haiku**。誤変換・繰り返し・句読点を整え、行数検証で欠落を防止。
-  - 第2段（要約）= **Gemini 3.5 Flash + Google検索グラウンディング**。番組名・出演者・時事を検索で確認して正確に要約。
+  - 第2段（要約）= **Claude Sonnet 5.5**。番組名・概要・話題（見出し/分野/時刻/詳細）を所定のフォーマットで要約。
 - **詳細なメール通知**: 番組名・時間帯・話題（見出し/時刻/詳細）を記載し、校正済み文字起こしを添付。
 - **設定の一元管理**: 個人設定は `config.sh` に集約。スクリプト本体は編集不要。
 
@@ -35,7 +35,7 @@ sox(取り込み) ─▶ ffmpeg(毎時分割・16kHzモノラルmp3化) ─▶ �
                                                               │
                                                     mover.sh（完成後にNASへ移送）
                                                               ▼
-録音(mp3) ─▶ whisper(生文字起こし) ─▶ Claude Haiku 校正 ─▶ Gemini 要約(検索) ─▶ メール通知
+録音(mp3) ─▶ whisper(生文字起こし) ─▶ Claude Haiku 校正 ─▶ Claude Sonnet 要約 ─▶ メール通知
                      │                      │                    │
               transcripts/            corrected/              texts/
               （30日保持）            （永続保存）           （30日保持）
@@ -52,8 +52,7 @@ recordings/（mp3・永続保存）
 - AMラジオの音声入力経路（USBオーディオIF等）。具体的な機材・接続・ノイズ対策は [hardware.md](hardware.md) を参照。
 - SMB 共有可能な NAS（手動マウント前提）
 - [Homebrew](https://brew.sh/)
-- Anthropic API キー（校正用）
-- Google Gemini API キー（要約用）
+- Anthropic API キー（校正・要約用）
 
 ### 依存パッケージ
 
@@ -75,7 +74,6 @@ $EDITOR scripts/config.sh        # メール・NAS・デバイス番号などを
 
 # 3. APIキーを専用ファイルに保存（chmod 600）
 printf '%s' 'sk-ant-...'  > ~/radio/.anthropic_api_key && chmod 600 ~/radio/.anthropic_api_key
-printf '%s' 'AIza...'     > ~/radio/.gemini_api_key    && chmod 600 ~/radio/.gemini_api_key
 
 # 4. whisper モデルを取得
 mkdir -p ~/radio/models
@@ -200,13 +198,13 @@ log show --last 20m --predicate 'subsystem == "com.apple.TCC"' --info | grep -i 
 
 ## コストの目安
 
-AIのAPIは従量課金です。校正（Haiku）は1時間分の入出力、要約（Gemini）は検索グラウンディングの検索回数に応じて課金されます。番組数や発話量により変動するため、運用開始後しばらくは各サービスのコンソールで実使用量を確認することを推奨します。
+AIのAPIは従量課金です。校正（Haiku）は1時間分の入出力、要約（Sonnet 5.5）は文字起こし全文の入力と要約の出力に応じて課金されます。Sonnet 5.5 は思考が常時有効なため、要約本文に加えて思考分の出力トークンも課金対象です。番組数や発話量により変動するため、運用開始後しばらくは各サービスのコンソールで実使用量を確認することを推奨します。
 
 ## トラブルシュート
 
 ### 要約に失敗したメールが届いた場合（手動リトライ）
 
-メール本文に「Gemini APIでの要約に失敗しました。修正済み文字起こしは添付パスを参照してください」と
+メール本文に「Claude APIでの要約に失敗しました。修正済み文字起こしは添付パスを参照してください」と
 表示された場合、録音・文字起こし・校正は成功しており、**要約（メール本文のまとめ）だけが失敗**した
 状態です。多くはAPIの一時的な混雑やレート制限が原因なので、その回だけ再処理すれば解消します。
 
@@ -229,8 +227,8 @@ bash ~/radio/scripts/run_analyzer.sh
 
 > 再処理では文字起こしからやり直されるため、校正・要約もすべて再生成されます。
 > 連続して失敗する場合は、APIキーの残高・レート制限や、`~/radio/analyzer.err` のログを確認してください。
-> 特にログに「上限(MAX_TOKENS)で途切れました」と出る場合は、`config.sh` の
-> `GEMINI_MAX_TOKENS_SUM` を引き上げてください。
+> 要約が途中で切れている場合は、`config.sh` の `CLAUDE_MAX_TOKENS_SUM` を引き上げてください
+> （Sonnet 5.5 では思考分のトークンもこの上限に含まれます）。
 
 ### 特定の回だけをまとめて再処理したい場合
 
@@ -375,6 +373,11 @@ touch ~/radio_nas/.wtest && rm ~/radio_nas/.wtest && echo "マウント正常"
 
 ## 変更履歴
 
+- **v1.5** — **要約を Gemini から Claude Sonnet 5.5 に変更**し、校正・要約とも Claude に統一。
+  Gemini API キーは不要になった。Sonnet 5.5 は思考が常時有効で、応答の先頭が `thinking`
+  ブロックになるため、`claude_call` は先頭要素ではなく `text` ブロックを連結して取り出すよう
+  変更（先頭だけを読むと毎回失敗扱いになる）。思考分のトークンも出力上限に含まれるため、
+  `CLAUDE_MAX_TOKENS_SUM` を 8000 とした。Google 検索グラウンディングは廃止。
 - **v1.4** — **運用面の堅牢化。** LaunchAgent での常駐運用（`install_launchagents.sh`）を
   追加し、ログイン時の自動起動とクラッシュ時の自動復帰（`KeepAlive`）を実現。加えて
   **SSHからでも安全に再起動できる**ようになった（LaunchAgent はGUIログインセッションの
@@ -407,7 +410,7 @@ touch ~/radio_nas/.wtest && rm ~/radio_nas/.wtest && echo "マウント正常"
 ## 注意事項
 
 - 本ソフトウェアは個人的な記録・研究用途を想定しています。録音物の保存・利用は、著作権法および各放送局の利用規約の範囲内で行ってください。録音物の再配布や公開は権利者の許諾が必要になる場合があります。
-- API キー・メール認証情報は `config.sh` および `.anthropic_api_key` / `.gemini_api_key` に保存され、`.gitignore` でコミット対象外にしています。これらを誤って公開しないよう注意してください。
+- API キー・メール認証情報は `config.sh` および `.anthropic_api_key` に保存され、`.gitignore` でコミット対象外にしています。これらを誤って公開しないよう注意してください。
 - 動作は macOS 環境に依存します。他OSでは `mount_smbfs`・`avfoundation`・`stat -f`・`date -r` 等の差異により修正が必要です。
 
 ## ライセンス

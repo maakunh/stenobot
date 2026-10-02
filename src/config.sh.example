@@ -43,13 +43,13 @@ MODEL_WHISPER="$BASE/models/ggml-large-v3-turbo.bin"
 MAIL_TO="you@example.com"
 MAIL_FROM="you@example.com"
 
-# ----- Claude API（校正に使用）-----
+# ----- Claude API（校正・要約に使用）-----
 CLAUDE_MODEL_FIX="claude-haiku-4-5-20251001"     # 校正モデル（Haiku）
 CLAUDE_KEY_FILE="$BASE/.anthropic_api_key"       # APIキー専用ファイル（chmod 600）
 CLAUDE_MAX_TOKENS_FIX=8000                        # 校正の出力上限
 FIX_CHUNK_LINES=20                                # 校正の1ブロック行数
 
-# ----- Gemini API（要約に使用・Google検索グラウンディング有効）-----
-GEMINI_MODEL="gemini-3.7-flash"                  # 要約モデル（検索グラウンディング対応を確認済み）
-GEMINI_KEY_FILE="$BASE/.gemini_api_key"          # APIキー専用ファイル（chmod 600）
-GEMINI_MAX_TOKENS_SUM=8000                        # 要約の出力上限
+CLAUDE_MODEL_SUM="claude-sonnet-5-5"             # 要約モデル（Sonnet 5.5）
+# 要約の出力上限。Sonnet 5.5 は思考が常時有効で、思考分のトークンもここに含まれる。
+# 要約本文は1500程度で収まるが、それに合わせると思考に食われて途切れるため大きめにする。
+CLAUDE_MAX_TOKENS_SUM=8000
