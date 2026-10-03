@@ -28,18 +28,105 @@ if [[ -z "$CLAUDE_API_KEY" ]]; then
   exit 1
 fi
 
-# ===== Claude API 呼び出し共通関数 =====
-# 使い方: claude_call <model> <max_tokens> <prompt文字列>
+# ----- Batch API 設定（config.sh に無ければ既定値）-----
+# Batch API は全トークンが半額。結果は非同期で返る（通常数分〜1時間、最大24時間）。
+USE_BATCH="${USE_BATCH:-1}"                          # 0 にすると従来どおり即時APIのみ
+BATCH_POLL_SECONDS="${BATCH_POLL_SECONDS:-30}"       # 完了確認の間隔
+BATCH_TIMEOUT_SECONDS="${BATCH_TIMEOUT_SECONDS:-3600}" # これを過ぎたら取り消して即時APIで処理
+# 要約の思考量。Sonnet 5.5 は思考が常時有効で、思考分も出力として課金される。
+# 要約は low でも品質がほぼ変わらないため low とする。Haiku 4.5 は effort 非対応なので校正には付けない。
+CLAUDE_EFFORT_SUM="${CLAUDE_EFFORT_SUM:-low}"
+
+# リクエスト本文（params）を組み立てる。effort が空なら output_config を付けない。
+# 使い方: claude_params <model> <max_tokens> <effort> < プロンプト
+claude_params() {
+  jq -Rs \
+    --arg model "$1" \
+    --argjson max_tokens "$2" \
+    --arg effort "$3" \
+    '{model:$model, max_tokens:$max_tokens, messages:[{role:"user", content:.}]}
+     + (if $effort == "" then {} else {output_config:{effort:$effort}} end)'
+}
+
+# 応答メッセージから text ブロックを連結して取り出す。Sonnet 5.5 等は思考が常時有効で、
+# content[0] が thinking ブロックになるため、先頭だけを読むと毎回失敗扱いになる。
+CLAUDE_TEXT_JQ='[.content[]? | select(.type=="text") | .text] | join("")'
+
+# ===== Claude Batch API 呼び出し関数 =====
+# 使い方: claude_batch <dir> <model> <max_tokens> <effort>
+#   dir 内の各 <id>.prompt を1つのバッチにまとめて送り、成功したものの応答を <id>.out に書く。
+#   失敗・期限切れ・取り消しになったものは .out を作らない。取りこぼしの扱い
+#   （即時APIでの再試行など）は呼び出し側が .out の有無で判断する。戻り値は常に0。
+claude_batch() {
+  local dir="$1" model="$2" max_tokens="$3" effort="$4"
+  local api="https://api.anthropic.com/v1/messages/batches"
+  local f id resp batch_id status results_url waited=0 canceled=0
+
+  for f in "$dir"/*.prompt; do
+    id=$(basename "$f" .prompt)
+    claude_params "$model" "$max_tokens" "$effort" < "$f" | jq -c --arg id "$id" '{custom_id:$id, params:.}'
+  done | jq -s '{requests:.}' > "$dir/request.json"
+
+  resp=$(curl -sS --max-time 120 "$api" \
+    -H "x-api-key: ${CLAUDE_API_KEY}" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d @"$dir/request.json" 2>/dev/null) || resp=""
+  batch_id=$(printf '%s' "$resp" | jq -r '.id // empty' 2>/dev/null || true)
+  if [[ -z "$batch_id" ]]; then
+    echo "$(date '+%F %T') WARN: バッチ作成失敗(${model}): $(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null || true)" >&2
+    return 0
+  fi
+
+  # 完了（ended）まで待つ。時間切れなら取り消し、取り消し完了（これも ended）まで待って
+  # 処理済みの分だけ受け取る。処理済みの分は課金されているので捨てない。
+  while :; do
+    sleep "$BATCH_POLL_SECONDS"
+    waited=$(( waited + BATCH_POLL_SECONDS ))
+    resp=$(curl -sS --max-time 60 "$api/$batch_id" \
+      -H "x-api-key: ${CLAUDE_API_KEY}" \
+      -H "anthropic-version: 2023-06-01" 2>/dev/null) || resp=""
+    status=$(printf '%s' "$resp" | jq -r '.processing_status // empty' 2>/dev/null || true)
+    [[ "$status" == "ended" ]] && break
+    if (( ! canceled && waited >= BATCH_TIMEOUT_SECONDS )); then
+      echo "$(date '+%F %T') WARN: バッチ ${batch_id} が ${BATCH_TIMEOUT_SECONDS}秒で終わらず、取り消します" >&2
+      curl -sS --max-time 60 -X POST "$api/$batch_id/cancel" \
+        -H "x-api-key: ${CLAUDE_API_KEY}" \
+        -H "anthropic-version: 2023-06-01" >/dev/null 2>&1 || true
+      canceled=1
+    fi
+  done
+
+  results_url=$(printf '%s' "$resp" | jq -r '.results_url // empty' 2>/dev/null || true)
+  [[ -z "$results_url" ]] && return 0
+  curl -sS --max-time 120 "$results_url" \
+    -H "x-api-key: ${CLAUDE_API_KEY}" \
+    -H "anthropic-version: 2023-06-01" -o "$dir/results.jsonl" 2>/dev/null || return 0
+
+  jq -r 'select(.result.type != "succeeded")
+         | "\(.custom_id) \(.result.type) \(.result.error.error.message // "")"' \
+    "$dir/results.jsonl" 2>/dev/null \
+    | while read -r line; do
+        echo "$(date '+%F %T') WARN: バッチ結果(${model}) ${line}" >&2
+      done
+  for f in "$dir"/*.prompt; do
+    id=$(basename "$f" .prompt)
+    jq -r --arg id "$id" \
+      "select(.custom_id == \$id and .result.type == \"succeeded\") | .result.message | ${CLAUDE_TEXT_JQ}" \
+      "$dir/results.jsonl" > "$dir/$id.out" 2>/dev/null || true
+    [[ -s "$dir/$id.out" ]] || rm -f "$dir/$id.out"
+  done
+  return 0
+}
+
+# ===== Claude API 呼び出し共通関数（即時API。バッチで取りこぼした分の再試行に使う）=====
+# 使い方: claude_call <model> <max_tokens> <prompt文字列> [effort]
 #   成功: 標準出力に応答テキスト、戻り値0
 #   失敗: 標準出力は空、戻り値1（最大3回リトライ後）
 claude_call() {
-  local model="$1"; local max_tokens="$2"; local prompt="$3"
+  local model="$1"; local max_tokens="$2"; local prompt="$3"; local effort="${4:-}"
   local req resp text errmsg attempt
-  req=$(jq -n \
-    --arg model "$model" \
-    --argjson max_tokens "$max_tokens" \
-    --arg prompt "$prompt" \
-    '{model:$model, max_tokens:$max_tokens, messages:[{role:"user", content:$prompt}]}')
+  req=$(printf '%s' "$prompt" | claude_params "$model" "$max_tokens" "$effort")
 
   for attempt in 1 2 3; do
     resp=$(curl -sS --max-time 180 https://api.anthropic.com/v1/messages \
@@ -48,9 +135,7 @@ claude_call() {
       -H "content-type: application/json" \
       -d "$req" 2>/dev/null) || resp=""
 
-    # 応答の text ブロックを連結して取り出す。Sonnet 5.5 等は思考が常時有効で、
-    # content[0] が thinking ブロックになるため、先頭だけを読むと毎回失敗扱いになる。
-    text=$(printf '%s' "$resp" | jq -r '[.content[]? | select(.type=="text") | .text] | join("")' 2>/dev/null)
+    text=$(printf '%s' "$resp" | jq -r "$CLAUDE_TEXT_JQ" 2>/dev/null)
     if [[ -n "$text" ]]; then
       printf '%s' "$text"
       return 0
@@ -174,25 +259,46 @@ for marker in $(ls -tr "$REC_DIR"/radio_*.mp3.done 2>/dev/null); do
 - 固有名詞は、読み（音）が同じか極めて近い表記に直す場合に限り修正してよい。
   読みの異なる別の語には置き換えない（例：「東宝大学」→「東邦大学」は可、「東京大学」は不可）。
   確信が持てない固有名詞は原文のまま残す。
+- 商品名・番組名・リスナー名など、放送中の固有の呼び名は原文のまま残す（一般的な語に言い換えない）。
+- 同一行内で表記を揃える目的で、正しい語を誤った語に合わせない。
 - 内容を要約・追加・削除しない（あくまで校正）。本文が「（無音）」の行はそのまま「（無音）」にする。
 - 出力は校正後の行のみ。前置き・説明・コードブロックは一切付けない。"
 
   # 本文を FIX_CHUNK_LINES 行ずつのブロックに分けて個別に校正→連結
   # （1回の出力を短く保ち、出力トークン上限での途中切れ・欠落を回避）
+  # 全ブロックのプロンプトを先に作り、1つのバッチでまとめて校正する。
+  # ブロックごとにバッチを分けると、完了待ちが直列に積み重なって処理が遅れるため。
   TOTAL_LINES=$(printf '%s\n' "$RAW_BODY" | grep -c .)
+  FIX_DIR="$WORK/batch_${STAMP}_fix"
+  rm -rf "$FIX_DIR"; mkdir -p "$FIX_DIR"
+  start_line=1
+  while (( start_line <= TOTAL_LINES )); do
+    BLOCK=$(printf '%s\n' "$RAW_BODY" | sed -n "${start_line},$(( start_line + FIX_CHUNK_LINES - 1 ))p")
+    BLOCK_LINES=$(printf '%s\n' "$BLOCK" | grep -c .)
+    printf '%s' "${FIX_INSTRUCTION}
+
+--- 入力（${BLOCK_LINES}行）---
+${BLOCK}" > "$FIX_DIR/$(printf 'b%05d' "$start_line").prompt"
+    start_line=$(( start_line + FIX_CHUNK_LINES ))
+  done
+  (( USE_BATCH )) && claude_batch "$FIX_DIR" "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" ""
+
   CORRECTED_BODY=""
   FIX_FAILED=0
   start_line=1
   while (( start_line <= TOTAL_LINES )); do
     BLOCK=$(printf '%s\n' "$RAW_BODY" | sed -n "${start_line},$(( start_line + FIX_CHUNK_LINES - 1 ))p")
     BLOCK_LINES=$(printf '%s\n' "$BLOCK" | grep -c .)
-    BLOCK_PROMPT="${FIX_INSTRUCTION}
-
---- 入力（${BLOCK_LINES}行）---
-${BLOCK}"
+    BLOCK_ID=$(printf 'b%05d' "$start_line")
 
     USE_RAW=0
-    if BLOCK_OUT=$(claude_call "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$BLOCK_PROMPT"); then
+    BLOCK_OK=0
+    if [[ -s "$FIX_DIR/$BLOCK_ID.out" ]]; then
+      BLOCK_OUT=$(cat "$FIX_DIR/$BLOCK_ID.out"); BLOCK_OK=1
+    elif BLOCK_OUT=$(claude_call "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$(cat "$FIX_DIR/$BLOCK_ID.prompt")"); then
+      BLOCK_OK=1
+    fi
+    if (( BLOCK_OK )); then
       # 欠落防止ガード：校正後の行数が入力と一致しない場合は信頼せず生ブロックを使う
       OUT_LINES=$(printf '%s\n' "$BLOCK_OUT" | grep -c .)
       if (( OUT_LINES != BLOCK_LINES )); then
@@ -252,11 +358,18 @@ ${BLOCK_OUT}"
 --- 校正済み文字起こし ---
 ${CORRECTED_BODY}"
 
-  if ! ANALYSIS=$(claude_call "$CLAUDE_MODEL_SUM" "$CLAUDE_MAX_TOKENS_SUM" "$SUM_PROMPT"); then
+  SUM_DIR="$WORK/batch_${STAMP}_sum"
+  rm -rf "$SUM_DIR"; mkdir -p "$SUM_DIR"
+  printf '%s' "$SUM_PROMPT" > "$SUM_DIR/summary.prompt"
+  (( USE_BATCH )) && claude_batch "$SUM_DIR" "$CLAUDE_MODEL_SUM" "$CLAUDE_MAX_TOKENS_SUM" "$CLAUDE_EFFORT_SUM"
+  if [[ -s "$SUM_DIR/summary.out" ]]; then
+    ANALYSIS=$(cat "$SUM_DIR/summary.out")
+  elif ! ANALYSIS=$(claude_call "$CLAUDE_MODEL_SUM" "$CLAUDE_MAX_TOKENS_SUM" "$SUM_PROMPT" "$CLAUDE_EFFORT_SUM"); then
     ANALYSIS="番組名: 不明
 全体概要: （Claude APIでの要約に失敗しました。修正済み文字起こしは添付パスを参照してください）
 話題数: 0"
   fi
+  rm -rf "$FIX_DIR" "$SUM_DIR"
 
   # ----- 番組名を要約結果から抽出（件名・本文の見出し用）-----
   PROGRAM=$(printf '%s\n' "$ANALYSIS" | sed -n 's/^番組名:[[:space:]]*//p' | head -1)

@@ -53,3 +53,12 @@ CLAUDE_MODEL_SUM="claude-sonnet-5-5"             # 要約モデル（Sonnet 5.5�
 # 要約の出力上限。Sonnet 5.5 は思考が常時有効で、思考分のトークンもここに含まれる。
 # 要約本文は1500程度で収まるが、それに合わせると思考に食われて途切れるため大きめにする。
 CLAUDE_MAX_TOKENS_SUM=8000
+# 要約の思考量（low / medium / high）。思考分も出力として課金されるため、要約は low とする。
+CLAUDE_EFFORT_SUM="low"
+
+# ----- Batch API（費用を半額にする）-----
+# 校正・要約を Batch API で送る。全トークンが半額になる代わりに、結果は非同期で返る
+# （通常数分〜1時間、最大24時間）ので、メールの到着がそのぶん遅れる。
+USE_BATCH=1                      # 0 にすると即時APIのみ（従来の動作）
+BATCH_POLL_SECONDS=30            # 完了確認の間隔（秒）
+BATCH_TIMEOUT_SECONDS=3600       # これを過ぎても終わらなければ取り消し、残りを即時APIで処理
