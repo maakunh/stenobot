@@ -44,10 +44,13 @@ MAIL_TO="you@example.com"
 MAIL_FROM="you@example.com"
 
 # ----- Claude API（校正・要約に使用）-----
-CLAUDE_MODEL_FIX="claude-haiku-4-5-20251001"     # 校正モデル（Haiku）
+CLAUDE_MODEL_FIX="claude-haiku-5-5"              # 校正モデル（Haiku 5.5）
 CLAUDE_KEY_FILE="$BASE/.anthropic_api_key"       # APIキー専用ファイル（chmod 600）
 CLAUDE_MAX_TOKENS_FIX=8000                        # 校正の出力上限
 FIX_CHUNK_LINES=20                                # 校正の1ブロック行数
+# 校正の思考量（low / medium / high）。Haiku 5.5 は思考が既定で有効で、指定しないと medium になる。
+# 校正は機械的な作業なので low とする。思考分のトークンも CLAUDE_MAX_TOKENS_FIX に含まれる。
+CLAUDE_EFFORT_FIX="low"
 
 CLAUDE_MODEL_SUM="claude-sonnet-5-5"             # 要約モデル（Sonnet 5.5）
 # 要約の出力上限。Sonnet 5.5 は思考が常時有効で、思考分のトークンもここに含まれる。

@@ -34,8 +34,10 @@ USE_BATCH="${USE_BATCH:-1}"                          # 0 にすると従来ど�
 BATCH_POLL_SECONDS="${BATCH_POLL_SECONDS:-30}"       # 完了確認の間隔
 BATCH_TIMEOUT_SECONDS="${BATCH_TIMEOUT_SECONDS:-3600}" # これを過ぎたら取り消して即時APIで処理
 # 要約の思考量。Sonnet 5.5 は思考が常時有効で、思考分も出力として課金される。
-# 要約は low でも品質がほぼ変わらないため low とする。Haiku 4.5 は effort 非対応なので校正には付けない。
+# 要約は low でも品質がほぼ変わらないため low とする。
 CLAUDE_EFFORT_SUM="${CLAUDE_EFFORT_SUM:-low}"
+# 校正の思考量。Haiku 5.5 も思考が既定で有効で、未指定だと medium になる。校正は low で足りる。
+CLAUDE_EFFORT_FIX="${CLAUDE_EFFORT_FIX:-low}"
 
 # リクエスト本文（params）を組み立てる。effort が空なら output_config を付けない。
 # 使い方: claude_params <model> <max_tokens> <effort> < プロンプト
@@ -281,7 +283,7 @@ for marker in $(ls -tr "$REC_DIR"/radio_*.mp3.done 2>/dev/null); do
 ${BLOCK}" > "$FIX_DIR/$(printf 'b%05d' "$start_line").prompt"
     start_line=$(( start_line + FIX_CHUNK_LINES ))
   done
-  (( USE_BATCH )) && claude_batch "$FIX_DIR" "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" ""
+  (( USE_BATCH )) && claude_batch "$FIX_DIR" "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$CLAUDE_EFFORT_FIX"
 
   CORRECTED_BODY=""
   FIX_FAILED=0
@@ -295,7 +297,7 @@ ${BLOCK}" > "$FIX_DIR/$(printf 'b%05d' "$start_line").prompt"
     BLOCK_OK=0
     if [[ -s "$FIX_DIR/$BLOCK_ID.out" ]]; then
       BLOCK_OUT=$(cat "$FIX_DIR/$BLOCK_ID.out"); BLOCK_OK=1
-    elif BLOCK_OUT=$(claude_call "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$(cat "$FIX_DIR/$BLOCK_ID.prompt")"); then
+    elif BLOCK_OUT=$(claude_call "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$(cat "$FIX_DIR/$BLOCK_ID.prompt")" "$CLAUDE_EFFORT_FIX"); then
       BLOCK_OK=1
     fi
     if (( BLOCK_OK )); then
