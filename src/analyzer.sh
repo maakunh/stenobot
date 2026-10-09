@@ -36,18 +36,23 @@ BATCH_TIMEOUT_SECONDS="${BATCH_TIMEOUT_SECONDS:-3600}" # これを過ぎたら�
 # 要約の思考量。Sonnet 5.5 は思考が常時有効で、思考分も出力として課金される。
 # 要約は low でも品質がほぼ変わらないため low とする。
 CLAUDE_EFFORT_SUM="${CLAUDE_EFFORT_SUM:-low}"
-# 校正の思考量。Haiku 5.5 も思考が既定で有効で、未指定だと medium になる。校正は low で足りる。
+# 校正の思考量と思考の有無。Haiku 5.5 は思考が既定で有効で、effort low でも1ブロックに
+# 思考だけで 3600〜8000 トークンを使い、校正本文が出力上限で途中切れになった。
+# 校正は機械的な作業なので思考を止める（disabled は effort high 以下でのみ受け付けられる）。
 CLAUDE_EFFORT_FIX="${CLAUDE_EFFORT_FIX:-low}"
+CLAUDE_THINKING_FIX="${CLAUDE_THINKING_FIX:-disabled}"
 
-# リクエスト本文（params）を組み立てる。effort が空なら output_config を付けない。
-# 使い方: claude_params <model> <max_tokens> <effort> < プロンプト
+# リクエスト本文（params）を組み立てる。effort / thinking が空ならその項目を付けない。
+# 使い方: claude_params <model> <max_tokens> <effort> [thinking] < プロンプト
 claude_params() {
   jq -Rs \
     --arg model "$1" \
     --argjson max_tokens "$2" \
     --arg effort "$3" \
+    --arg thinking "${4:-}" \
     '{model:$model, max_tokens:$max_tokens, messages:[{role:"user", content:.}]}
-     + (if $effort == "" then {} else {output_config:{effort:$effort}} end)'
+     + (if $effort == "" then {} else {output_config:{effort:$effort}} end)
+     + (if $thinking == "" then {} else {thinking:{type:$thinking}} end)'
 }
 
 # 応答メッセージから text ブロックを連結して取り出す。Sonnet 5.5 等は思考が常時有効で、
@@ -55,18 +60,18 @@ claude_params() {
 CLAUDE_TEXT_JQ='[.content[]? | select(.type=="text") | .text] | join("")'
 
 # ===== Claude Batch API 呼び出し関数 =====
-# 使い方: claude_batch <dir> <model> <max_tokens> <effort>
+# 使い方: claude_batch <dir> <model> <max_tokens> <effort> [thinking]
 #   dir 内の各 <id>.prompt を1つのバッチにまとめて送り、成功したものの応答を <id>.out に書く。
 #   失敗・期限切れ・取り消しになったものは .out を作らない。取りこぼしの扱い
 #   （即時APIでの再試行など）は呼び出し側が .out の有無で判断する。戻り値は常に0。
 claude_batch() {
-  local dir="$1" model="$2" max_tokens="$3" effort="$4"
+  local dir="$1" model="$2" max_tokens="$3" effort="$4" thinking="${5:-}"
   local api="https://api.anthropic.com/v1/messages/batches"
   local f id resp batch_id status results_url waited=0 canceled=0
 
   for f in "$dir"/*.prompt; do
     id=$(basename "$f" .prompt)
-    claude_params "$model" "$max_tokens" "$effort" < "$f" | jq -c --arg id "$id" '{custom_id:$id, params:.}'
+    claude_params "$model" "$max_tokens" "$effort" "$thinking" < "$f" | jq -c --arg id "$id" '{custom_id:$id, params:.}'
   done | jq -s '{requests:.}' > "$dir/request.json"
 
   resp=$(curl -sS --max-time 120 "$api" \
@@ -105,8 +110,12 @@ claude_batch() {
     -H "x-api-key: ${CLAUDE_API_KEY}" \
     -H "anthropic-version: 2023-06-01" -o "$dir/results.jsonl" 2>/dev/null || return 0
 
-  jq -r 'select(.result.type != "succeeded")
-         | "\(.custom_id) \(.result.type) \(.result.error.error.message // "")"' \
+  # 出力上限で途中切れしたもの（succeeded でも本文が欠ける）も警告に出す
+  jq -r 'if .result.type != "succeeded"
+         then "\(.custom_id) \(.result.type) \(.result.error.error.message // "")"
+         elif .result.message.stop_reason == "max_tokens"
+         then "\(.custom_id) 出力上限で途中切れ(output_tokens=\(.result.message.usage.output_tokens))"
+         else empty end' \
     "$dir/results.jsonl" 2>/dev/null \
     | while read -r line; do
         echo "$(date '+%F %T') WARN: バッチ結果(${model}) ${line}" >&2
@@ -122,13 +131,13 @@ claude_batch() {
 }
 
 # ===== Claude API 呼び出し共通関数（即時API。バッチで取りこぼした分の再試行に使う）=====
-# 使い方: claude_call <model> <max_tokens> <prompt文字列> [effort]
+# 使い方: claude_call <model> <max_tokens> <prompt文字列> [effort] [thinking]
 #   成功: 標準出力に応答テキスト、戻り値0
 #   失敗: 標準出力は空、戻り値1（最大3回リトライ後）
 claude_call() {
-  local model="$1"; local max_tokens="$2"; local prompt="$3"; local effort="${4:-}"
+  local model="$1"; local max_tokens="$2"; local prompt="$3"; local effort="${4:-}"; local thinking="${5:-}"
   local req resp text errmsg attempt
-  req=$(printf '%s' "$prompt" | claude_params "$model" "$max_tokens" "$effort")
+  req=$(printf '%s' "$prompt" | claude_params "$model" "$max_tokens" "$effort" "$thinking")
 
   for attempt in 1 2 3; do
     resp=$(curl -sS --max-time 180 https://api.anthropic.com/v1/messages \
@@ -139,6 +148,9 @@ claude_call() {
 
     text=$(printf '%s' "$resp" | jq -r "$CLAUDE_TEXT_JQ" 2>/dev/null)
     if [[ -n "$text" ]]; then
+      if [[ "$(printf '%s' "$resp" | jq -r '.stop_reason' 2>/dev/null)" == "max_tokens" ]]; then
+        echo "$(date '+%F %T') WARN: Claude API(${model}) 出力上限(${max_tokens})で途中切れ" >&2
+      fi
       printf '%s' "$text"
       return 0
     fi
@@ -283,7 +295,7 @@ for marker in $(ls -tr "$REC_DIR"/radio_*.mp3.done 2>/dev/null); do
 ${BLOCK}" > "$FIX_DIR/$(printf 'b%05d' "$start_line").prompt"
     start_line=$(( start_line + FIX_CHUNK_LINES ))
   done
-  (( USE_BATCH )) && claude_batch "$FIX_DIR" "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$CLAUDE_EFFORT_FIX"
+  (( USE_BATCH )) && claude_batch "$FIX_DIR" "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$CLAUDE_EFFORT_FIX" "$CLAUDE_THINKING_FIX"
 
   CORRECTED_BODY=""
   FIX_FAILED=0
@@ -297,7 +309,7 @@ ${BLOCK}" > "$FIX_DIR/$(printf 'b%05d' "$start_line").prompt"
     BLOCK_OK=0
     if [[ -s "$FIX_DIR/$BLOCK_ID.out" ]]; then
       BLOCK_OUT=$(cat "$FIX_DIR/$BLOCK_ID.out"); BLOCK_OK=1
-    elif BLOCK_OUT=$(claude_call "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$(cat "$FIX_DIR/$BLOCK_ID.prompt")" "$CLAUDE_EFFORT_FIX"); then
+    elif BLOCK_OUT=$(claude_call "$CLAUDE_MODEL_FIX" "$CLAUDE_MAX_TOKENS_FIX" "$(cat "$FIX_DIR/$BLOCK_ID.prompt")" "$CLAUDE_EFFORT_FIX" "$CLAUDE_THINKING_FIX"); then
       BLOCK_OK=1
     fi
     if (( BLOCK_OK )); then
